@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove|deconfigure)
+        if [ -d /usr/lib/czcamera ]; then
+            find /usr/lib/czcamera -depth -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
+        fi
+        ;;
+esac
+
+exit 0

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=czcamera
+Comment=Camera, video, timelapse, and gallery for CardputerZero
+Exec=/usr/bin/czcamera
+Icon=/usr/share/APPLaunch/share/images/czcamera.png
+Terminal=false
+Categories=AudioVideo;Photography;

@@ -1,0 +1,32 @@
+FROM --platform=linux/arm64 debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    pkg-config \
+    libjpeg62-turbo-dev \
+    libfreetype-dev \
+    dpkg-dev \
+    python3 \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY app /app/app
+COPY cam-helper /app/cam-helper
+COPY packaging /app/packaging
+
+RUN rm -rf /app/app/build /app/app/build-arm64 \
+    && cmake -S /app/app -B /app/app/build-arm64 \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CXX_FLAGS_RELEASE="-O2" \
+        -DCZ_BUILD_APP=ON \
+        -DCZ_TARGET_DEVICE=ON \
+        -DCZ_BUILD_TESTS=ON \
+    && cmake --build /app/app/build-arm64 -j"$(nproc)" \
+    && ctest --test-dir /app/app/build-arm64 --output-on-failure \
+    && PYTHONPATH=/app/cam-helper python3 -W error -m unittest discover -s /app/cam-helper/tests -v \
+    && /app/packaging/build-deb.sh --local --bin /app/app/build-arm64/czcamera

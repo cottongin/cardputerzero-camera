@@ -1,0 +1,11 @@
+Package: czcamera
+Version: 1.0.0-m5stack1
+Section: graphics
+Priority: optional
+Architecture: arm64
+Maintainer: CardputerZero Camera <noreply@local>
+Depends: python3 (>= 3.9), python3-picamera2, ffmpeg, alsa-utils, libjpeg62-turbo | libjpeg8, libfreetype6, libc6, libstdc++6
+Description: Camera application for CardputerZero (photo, video, timelapse, gallery)
+ Fullscreen 320x170 fbdev/evdev camera application (czcamera) and Picamera2
+ subprocess worker (czcamera-cam) with 9 RGB24 filters, timelapse capture
+ and MP4 assembly, gallery viewer, and on-device video playback.
