@@ -259,6 +259,17 @@ void test_sim_backend_lifecycle() {
     assert(from_env != nullptr);
     assert(from_env->status().backend_name == "sim");
   }
+  {
+    EnvVarGuard clear_backend("CZCAMERA_BACKEND");
+    EnvVarGuard clear_bin("CZCAMERA_CAM_BIN");
+    auto default_backend = cz::create_camera_backend(false);
+    assert(default_backend != nullptr);
+#ifdef CZ_TARGET_DEVICE
+    assert(default_backend->status().backend_name == "picamera2-subprocess");
+#else
+    assert(default_backend->status().backend_name == "sim");
+#endif
+  }
 
   cz::SimCameraBackend sim;
   assert(!sim.status().ready);

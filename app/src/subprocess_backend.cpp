@@ -1111,8 +1111,9 @@ void SubprocessCameraBackend::stdout_reader_loop(int stdout_fd,
 
   std::string reason = "czcamera-cam stdout closed unexpectedly";
   bool reaped_in_reader = false;
+  std::unique_lock<std::mutex> reap_lock(reap_mutex_, std::defer_lock);
   if (!was_stopping && pid > 0) {
-    std::lock_guard<std::mutex> reap_lock(reap_mutex_);
+    reap_lock.lock();
     bool still_ours = false;
     {
       std::lock_guard<std::mutex> st_lock(state_mutex_);
@@ -1129,6 +1130,8 @@ void SubprocessCameraBackend::stdout_reader_loop(int stdout_fd,
     }
   }
 
+  // Keep reap_lock held while clearing child_pid_ under state_mutex_
+  // (maintains lock order reap_mutex_ -> state_mutex_ matching stop_locked).
   std::lock_guard<std::mutex> st_lock(state_mutex_);
   if (reaped_in_reader && child_pid_ == pid) {
     child_pid_ = -1;
