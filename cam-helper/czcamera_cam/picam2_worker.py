@@ -298,6 +298,7 @@ class Picam2Worker:
         self._picam2: Any = None
         self._camera_properties: dict[str, Any] = {}
         self._sensor_size: tuple[int, int] = (3280, 2464)
+        self._state_lock = threading.Lock()
         self._started = False
         self._paused = False
         self._recording = False
@@ -305,6 +306,7 @@ class Picam2Worker:
         self._mode = "photo"
         self._main_size = (3280, 2464)
         self._preview_size = (226, 170)
+        self._lores_stride: Optional[int] = None
         self._fps = 30
         self._zoom = 1.0
         self._ev = 0.0
@@ -355,7 +357,36 @@ class Picam2Worker:
             }
         )
 
-    def _extract_lores_yuv420(self, request: Any, width: int, height: int) -> bytes:
+    def _read_negotiated_lores_stride(self, request: Any = None) -> Optional[int]:
+        if request is not None:
+            req_cfg = getattr(request, "config", None)
+            if isinstance(req_cfg, dict):
+                lores = req_cfg.get("lores")
+                if isinstance(lores, dict) and isinstance(lores.get("stride"), int) and lores["stride"] > 0:
+                    return int(lores["stride"])
+        if self._picam2 is not None:
+            stream_cfg_fn = getattr(self._picam2, "stream_configuration", None)
+            if callable(stream_cfg_fn):
+                try:
+                    lores = stream_cfg_fn("lores")
+                    if isinstance(lores, dict) and isinstance(lores.get("stride"), int) and lores["stride"] > 0:
+                        return int(lores["stride"])
+                except Exception:
+                    pass
+            cam_cfg = getattr(self._picam2, "camera_config", None)
+            if isinstance(cam_cfg, dict):
+                lores = cam_cfg.get("lores")
+                if isinstance(lores, dict) and isinstance(lores.get("stride"), int) and lores["stride"] > 0:
+                    return int(lores["stride"])
+        return None
+
+    def _extract_lores_yuv420(
+        self,
+        request: Any,
+        width: int,
+        height: int,
+        stride_hint: Optional[int] = None,
+    ) -> bytes:
         if hasattr(request, "make_buffer"):
             raw = request.make_buffer("lores")
         else:
@@ -363,15 +394,21 @@ class Picam2Worker:
 
         mv = memoryview(raw).cast("B")
         expected = width * height * 3 // 2
-        if len(mv) == expected:
+        if len(mv) < expected:
             return bytes(mv)
 
-        total_rows = height * 3 // 2
-        if total_rows <= 0 or len(mv) < expected:
+        stride = self._read_negotiated_lores_stride(request) or stride_hint
+        if stride is None:
+            if len(mv) == expected:
+                return bytes(mv)
+            total_rows = height * 3 // 2
+            stride = (len(mv) // total_rows) if total_rows > 0 else width
+
+        if stride <= width:
             return bytes(mv[:expected])
 
-        stride = len(mv) // total_rows
-        if stride <= width:
+        required_strided = (height * stride) + 2 * ((height // 2) * (stride // 2))
+        if len(mv) < required_strided:
             return bytes(mv[:expected])
 
         out = bytearray(expected)
@@ -400,15 +437,22 @@ class Picam2Worker:
         return bytes(out)
 
     def _on_request(self, request: Any) -> None:
-        if self._paused or not self._started:
-            return
-        pw, ph = self._preview_size
+        with self._state_lock:
+            if self._paused or not self._started:
+                return
+            pw, ph = self._preview_size
+            is_16_9 = self._is_16_9
+            stride_hint = self._lores_stride
         try:
-            payload = self._extract_lores_yuv420(request, pw, ph)
+            payload = self._extract_lores_yuv420(request, pw, ph, stride_hint=stride_hint)
         except Exception:
             return
-        flags = FLAG_ASPECT_16_9 if self._is_16_9 else 0
+        flags = FLAG_ASPECT_16_9 if is_16_9 else 0
         self._frame_writer.push_frame(pw, ph, PIXFMT_YUV420, flags, payload)
+
+    def _current_scaler_crop(self) -> tuple[int, int, int, int]:
+        aspect = (16, 9) if self._is_16_9 else (4, 3)
+        return compute_scaler_crop(self._sensor_size, aspect[0], aspect[1], self._zoom)
 
     def configure(
         self,
@@ -424,49 +468,41 @@ class Picam2Worker:
     ) -> dict[str, Any]:
         if self._recording:
             raise RuntimeError("camera_recording")
-        if self._picam2 is None:
-            self._open_camera()
+        if mode not in ("photo", "video", "timelapse"):
+            raise ValueError(f"Unsupported mode: {mode}")
 
         pw = max(2, int(preview_w) & ~1)
         ph = max(2, int(preview_h) & ~1)
         mw = max(2, int(main_w) & ~1)
         mh = max(2, int(main_h) & ~1)
+        req_fps = max(1, int(fps))
+        req_zoom = max(1.0, min(4.0, float(zoom)))
+        req_ev = max(-2.0, min(2.0, float(ev)))
 
-        self._mode = mode
-        self._main_size = (mw, mh)
-        self._preview_size = (pw, ph)
-        self._fps = max(1, int(fps))
-        self._transform_str = transform
-        self._is_16_9 = _is_16_9_mode(mode, mw, mh)
-        self._last_config_kwargs = {
-            "mode": mode,
-            "main_w": mw,
-            "main_h": mh,
-            "preview_w": pw,
-            "preview_h": ph,
-            "fps": self._fps,
-            "zoom": float(zoom),
-            "ev": float(ev),
-            "transform": transform,
-        }
+        if self._picam2 is None:
+            self._open_camera()
 
-        if self._started:
-            self._picam2.post_callback = None
-            self._picam2.stop()
-            self._started = False
-
+        # Validate transform before stopping camera or mutating worker state.
         transform_obj = resolve_transform(
             transform,
             self._camera_properties,
             transform_cls=self._transform_cls,
         )
+
+        # Detach callback and stop camera before mutating shared geometry/state.
+        if self._started:
+            self._picam2.post_callback = None
+            self._picam2.stop()
+            with self._state_lock:
+                self._started = False
+
         lores_cfg = {"size": (pw, ph), "format": "YUV420"}
         if mode == "video":
             config = self._picam2.create_video_configuration(
                 main={"size": (mw, mh), "format": "YUV420"},
                 lores=lores_cfg,
                 transform=transform_obj,
-                controls={"FrameRate": self._fps},
+                controls={"FrameRate": req_fps},
             )
         else:
             config = self._picam2.create_still_configuration(
@@ -476,12 +512,41 @@ class Picam2Worker:
             )
 
         self._picam2.configure(config)
-        self._picam2.post_callback = self._on_request
-        self._picam2.start()
-        self._started = True
-        self._paused = False
+        negotiated_stride = self._read_negotiated_lores_stride()
+        is_16_9 = _is_16_9_mode(mode, mw, mh)
 
-        self.set_controls(zoom=zoom, ev=ev)
+        with self._state_lock:
+            self._mode = mode
+            self._main_size = (mw, mh)
+            self._preview_size = (pw, ph)
+            self._lores_stride = negotiated_stride
+            self._fps = req_fps
+            self._transform_str = transform
+            self._is_16_9 = is_16_9
+            self._last_config_kwargs = {
+                "mode": mode,
+                "main_w": mw,
+                "main_h": mh,
+                "preview_w": pw,
+                "preview_h": ph,
+                "fps": req_fps,
+                "zoom": req_zoom,
+                "ev": req_ev,
+                "transform": transform,
+            }
+            self._paused = False
+            self._started = True
+
+        self._picam2.post_callback = self._on_request
+        try:
+            self._picam2.start()
+        except Exception:
+            with self._state_lock:
+                self._started = False
+            self._picam2.post_callback = None
+            raise
+
+        self.set_controls(zoom=req_zoom, ev=req_ev)
         return {
             "mode": self._mode,
             "main_w": mw,
@@ -505,11 +570,9 @@ class Picam2Worker:
             self._last_config_kwargs["ev"] = self._ev
 
         if self._picam2 is not None and self._started:
-            aspect = (16, 9) if self._is_16_9 else (4, 3)
-            crop = compute_scaler_crop(self._sensor_size, aspect[0], aspect[1], self._zoom)
             self._picam2.set_controls(
                 {
-                    "ScalerCrop": crop,
+                    "ScalerCrop": self._current_scaler_crop(),
                     "ExposureValue": float(self._ev),
                 }
             )
@@ -523,7 +586,8 @@ class Picam2Worker:
 
         req_w = max(2, int(width) & ~1)
         req_h = max(2, int(height) & ~1)
-        if (req_w, req_h) != self._main_size and hasattr(
+        needs_mode_switch = self._mode == "video" or (req_w, req_h) != self._main_size
+        if needs_mode_switch and hasattr(
             self._picam2, "switch_mode_and_capture_file"
         ):
             transform_obj = resolve_transform(
@@ -531,13 +595,19 @@ class Picam2Worker:
                 self._camera_properties,
                 transform_cls=self._transform_cls,
             )
+            still_controls = {
+                "ScalerCrop": compute_scaler_crop(self._sensor_size, 4, 3, self._zoom),
+                "ExposureValue": float(self._ev),
+            }
             still_cfg = self._picam2.create_still_configuration(
                 main={"size": (req_w, req_h), "format": "RGB888"},
                 lores={"size": self._preview_size, "format": "YUV420"},
                 transform=transform_obj,
+                controls=still_controls,
             )
             self._picam2.switch_mode_and_capture_file(still_cfg, tmp_path, format="jpeg")
-            self._main_size = (req_w, req_h)
+            # Re-apply active controls after picamera2 restores the prior mode.
+            self.set_controls()
         else:
             self._picam2.capture_file(tmp_path, format="jpeg")
 
@@ -644,21 +714,24 @@ class Picam2Worker:
     def pause(self) -> dict[str, Any]:
         if self._recording:
             self.stop_video()
+        with self._state_lock:
+            self._paused = True
+            was_started = self._started
+            self._started = False
         if self._picam2 is not None:
             self._picam2.post_callback = None
-            if self._started:
+            if was_started:
                 self._picam2.stop()
-                self._started = False
             self._picam2.close()
             self._picam2 = None
-        self._paused = True
         return {}
 
     def resume(self) -> dict[str, Any]:
         if not self._paused and self._picam2 is not None:
             return {}
         self._open_camera()
-        self._paused = False
+        with self._state_lock:
+            self._paused = False
         if self._last_config_kwargs is not None:
             self.configure(**self._last_config_kwargs)
         return {}
@@ -669,12 +742,15 @@ class Picam2Worker:
                 self.stop_video()
             except Exception:
                 self._recording = False
+        with self._state_lock:
+            self._paused = True
+            was_started = self._started
+            self._started = False
         if self._picam2 is not None:
             try:
                 self._picam2.post_callback = None
-                if self._started:
+                if was_started:
                     self._picam2.stop()
-                    self._started = False
                 self._picam2.close()
             finally:
                 self._picam2 = None

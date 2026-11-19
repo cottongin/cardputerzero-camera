@@ -189,9 +189,11 @@ class JsonProtocolServer:
         worker_factory: Callable[[Callable[[dict[str, Any]], None]], Any],
         stdin: TextIO,
         stdout: TextIO,
+        wakeup_fd: Optional[int] = None,
     ) -> None:
         self._stdin = stdin
         self._stdout = stdout
+        self._wakeup_fd = wakeup_fd
         self._write_lock = threading.Lock()
         self._shutdown_requested = False
         self._worker = worker_factory(self.emit_event)
@@ -282,14 +284,72 @@ class JsonProtocolServer:
         except Exception as exc:  # noqa: BLE001
             self._reply_err(cmd_id, str(exc))
 
+    def _get_stdin_fd(self) -> Optional[int]:
+        try:
+            fd = self._stdin.fileno()
+        except (AttributeError, OSError, ValueError):
+            return None
+        return fd if isinstance(fd, int) and fd >= 0 else None
+
+    def _read_line_fd(self, stdin_fd: int, wakeup_fd: int, buf: bytearray) -> str:
+        while True:
+            nl = buf.find(b"\n")
+            if nl != -1:
+                line_bytes = bytes(buf[: nl + 1])
+                del buf[: nl + 1]
+                return line_bytes.decode("utf-8", errors="replace")
+
+            if self._shutdown_requested:
+                return ""
+
+            try:
+                rlist, _, _ = select.select([stdin_fd, wakeup_fd], [], [], 0.25)
+            except (InterruptedError, OSError, ValueError):
+                if self._shutdown_requested:
+                    return ""
+                continue
+
+            if wakeup_fd in rlist:
+                while True:
+                    try:
+                        drained = os.read(wakeup_fd, 256)
+                        if not drained:
+                            break
+                    except BlockingIOError:
+                        break
+                    except OSError:
+                        break
+                if self._shutdown_requested:
+                    return ""
+
+            if stdin_fd in rlist:
+                try:
+                    chunk = os.read(stdin_fd, 4096)
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    return ""
+                if not chunk:
+                    if buf:
+                        tail = bytes(buf).decode("utf-8", errors="replace")
+                        buf.clear()
+                        return tail
+                    return ""
+                buf.extend(chunk)
+
     def run(self) -> int:
         self._worker.start()
+        stdin_fd = self._get_stdin_fd() if self._wakeup_fd is not None else None
+        fd_buf = bytearray()
         try:
             while not self._shutdown_requested:
-                try:
-                    raw_line = self._stdin.readline()
-                except (OSError, ValueError):
-                    break
+                if stdin_fd is not None and self._wakeup_fd is not None:
+                    raw_line = self._read_line_fd(stdin_fd, self._wakeup_fd, fd_buf)
+                else:
+                    try:
+                        raw_line = self._stdin.readline()
+                    except (OSError, ValueError):
+                        break
                 if not raw_line:
                     break
                 line = raw_line.strip()

@@ -333,6 +333,67 @@ class ProtocolTest(unittest.TestCase):
             if proc.stderr:
                 proc.stderr.close()
 
+    def test_sigterm_exits_cleanly_without_reentrant_error(self):
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        bin_path = os.path.join(repo_root, "cam-helper", "bin", "czcamera-cam")
+        r_fd, w_fd = os.pipe()
+        os.set_inheritable(w_fd, True)
+
+        proc = subprocess.Popen(
+            [bin_path, "--frame-fd", str(w_fd), "--mock-driver"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            pass_fds=(w_fd,),
+            text=True,
+            bufsize=1,
+        )
+        os.close(w_fd)
+        try:
+            assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
+            ready = json.loads(proc.stdout.readline())
+            self.assertEqual(ready["event"], "ready")
+
+            proc.stdin.write(
+                json.dumps(
+                    {
+                        "id": 1,
+                        "cmd": "configure",
+                        "mode": "photo",
+                        "main_w": 3280,
+                        "main_h": 2464,
+                        "preview_w": 226,
+                        "preview_h": 170,
+                        "fps": 30,
+                        "zoom": 1.0,
+                        "ev": 0.0,
+                        "transform": "auto",
+                    }
+                )
+                + "\n"
+            )
+            proc.stdin.flush()
+            rep = json.loads(proc.stdout.readline())
+            self.assertTrue(rep["ok"])
+
+            # Leave stdin open while blocked waiting for commands, then send SIGTERM.
+            proc.terminate()
+            rc = proc.wait(timeout=5.0)
+            stderr_out = proc.stderr.read()
+            self.assertEqual(rc, 0, f"Unexpected non-zero exit code {rc}, stderr={stderr_out!r}")
+            self.assertEqual(stderr_out, "")
+        finally:
+            os.close(r_fd)
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5.0)
+            if proc.stdin:
+                proc.stdin.close()
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.stderr:
+                proc.stderr.close()
+
 
 if __name__ == "__main__":
     unittest.main()

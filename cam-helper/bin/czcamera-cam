@@ -51,18 +51,20 @@ def main(argv: Optional[list[str]] = None) -> int:
             return MockCameraDriver(frame_writer=frame_writer, emit_event=emit_event)
         return Picam2Worker(frame_writer=frame_writer, emit_event=emit_event)
 
+    wakeup_r, wakeup_w = os.pipe()
+    os.set_blocking(wakeup_r, False)
+    os.set_blocking(wakeup_w, False)
+    prev_wakeup_fd = signal.set_wakeup_fd(wakeup_w, warn_on_full_buffer=False)
+
     server = JsonProtocolServer(
         worker_factory=build_worker,
         stdin=sys.stdin,
         stdout=sys.stdout,
+        wakeup_fd=wakeup_r,
     )
 
     def _handle_signal(_signum: int, _frame: object) -> None:
         server.request_shutdown()
-        try:
-            sys.stdin.close()
-        except OSError:
-            pass
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
@@ -70,6 +72,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         return server.run()
     finally:
+        try:
+            signal.set_wakeup_fd(prev_wakeup_fd)
+        except (OSError, ValueError):
+            pass
+        for fd in (wakeup_r, wakeup_w):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         frame_writer.stop()
 
 

@@ -35,20 +35,22 @@ class FakeFrameWriter:
 
 
 class FakeRequest:
-    def __init__(self, width, height, stride=None):
+    def __init__(self, width, height, stride=None, trailing_bytes=0, config=None):
         self.width = width
         self.height = height
         self.stride = stride or width
+        self.trailing_bytes = trailing_bytes
+        self.config = config
 
     def make_buffer(self, name):
         assert name == "lores"
-        # Produce Y plane (height rows of stride) + U (height//2 rows of stride//2) + V
+        # Produce Y plane (height rows of stride) + U (height//2 rows of stride//2) + V + optional trailing DMA padding
         y_rows = b"".join(bytes([100] * self.width + [255] * (self.stride - self.width)) for _ in range(self.height))
         u_stride = self.stride // 2
         u_w = self.width // 2
         u_rows = b"".join(bytes([128] * u_w + [255] * (u_stride - u_w)) for _ in range(self.height // 2))
         v_rows = b"".join(bytes([129] * u_w + [255] * (u_stride - u_w)) for _ in range(self.height // 2))
-        return y_rows + u_rows + v_rows
+        return y_rows + u_rows + v_rows + (b"\xaa" * self.trailing_bytes)
 
 
 class FakeH264Encoder:
@@ -85,6 +87,7 @@ class FakePicamera2:
             "Rotation": rotation,
         }
         self.configured = None
+        self.camera_config = None
         self.started = False
         self.closed = False
         self.controls_history = []
@@ -93,6 +96,10 @@ class FakePicamera2:
         self.recording = False
         self.recording_attempts = []
         self.captured_files = []
+        self.direct_captures = []
+        self.switched_captures = []
+        self.events = []
+        self.negotiated_stride = None
         self.encoder = None
         self.output = None
         FakePicamera2.instances.append(self)
@@ -118,12 +125,21 @@ class FakePicamera2:
 
     def configure(self, config):
         self.configured = config
+        cfg_copy = dict(config)
+        if config.get("lores") is not None:
+            lores = dict(config["lores"])
+            lores["stride"] = self.negotiated_stride or lores["size"][0]
+            cfg_copy["lores"] = lores
+        self.camera_config = cfg_copy
+        self.events.append(("configure", config["type"]))
 
     def start(self):
         self.started = True
+        self.events.append(("start", self.configured["type"] if self.configured else None))
 
     def stop(self):
         self.started = False
+        self.events.append(("stop", self.post_callback is None))
 
     def close(self):
         self.closed = True
@@ -133,12 +149,19 @@ class FakePicamera2:
 
     def capture_file(self, file_output, name="main", format=None):
         self.captured_files.append((file_output, name, format))
+        self.direct_captures.append((file_output, self.configured["main"]["size"], self.configured["main"]["format"], format))
         with open(file_output, "wb") as f:
             f.write(b"\xff\xd8\xff\xe0MOCKJPEG\xff\xd9")
 
     def switch_mode_and_capture_file(self, camera_config, file_output, name="main", format=None):
+        prev_config = self.configured
+        prev_cam_config = self.camera_config
+        self.switched_captures.append((camera_config, file_output, name, format))
         self.configured = camera_config
         self.capture_file(file_output, name=name, format=format)
+        # Real picamera2 restores the prior configuration after capture completes.
+        self.configured = prev_config
+        self.camera_config = prev_cam_config
 
     def start_recording(self, encoder, output):
         self.recording_attempts.append((encoder, output))
@@ -155,10 +178,10 @@ class FakePicamera2:
     def stop_recording(self):
         self.recording = False
 
-    def emit_lores_frame(self, stride=None):
+    def emit_lores_frame(self, stride=None, trailing_bytes=0, request_config=None):
         lores = self.configured["lores"]
         w, h = lores["size"]
-        req = FakeRequest(w, h, stride=stride)
+        req = FakeRequest(w, h, stride=stride, trailing_bytes=trailing_bytes, config=request_config)
         cb = self.post_callback or self.pre_callback
         if cb is not None:
             cb(req)
@@ -252,6 +275,7 @@ class Picam2WorkerTest(unittest.TestCase):
         self.assertEqual(events[0]["backend"], "picamera2")
 
         picam = FakePicamera2.instances[-1]
+        picam.negotiated_stride = 256
         worker.configure(
             mode="video",
             main_w=1280,
@@ -393,24 +417,179 @@ class Picam2WorkerTest(unittest.TestCase):
             preview_w=226,
             preview_h=170,
             fps=30,
-            zoom=1.0,
-            ev=0.0,
+            zoom=2.0,
+            ev=-0.5,
             transform="auto",
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
+            # 1st capture: matches active photo main_size -> direct capture_file
             still_a = os.path.join(tmpdir, ".IMG_1.jpg.tmp")
             res_a = worker.capture_still(still_a, 3280, 2464)
             self.assertEqual(res_a["width"], 3280)
             self.assertEqual(res_a["height"], 2464)
             self.assertGreater(res_a["bytes"], 0)
             self.assertEqual(picam.captured_files[-1], (still_a, "main", "jpeg"))
+            self.assertEqual(len(picam.switched_captures), 0)
 
+            # 2nd capture: different size -> switch_mode_and_capture_file with controls + restore
+            controls_before = len(picam.controls_history)
             still_b = os.path.join(tmpdir, ".IMG_2.jpg.tmp")
             res_b = worker.capture_still(still_b, 1640, 1232)
             self.assertEqual(res_b["width"], 1640)
             self.assertEqual(res_b["height"], 1232)
-            self.assertEqual(picam.captured_files[-1], (still_b, "main", "jpeg"))
+            self.assertEqual(len(picam.switched_captures), 1)
+            sw_cfg, sw_path, sw_name, sw_fmt = picam.switched_captures[-1]
+            self.assertEqual((sw_path, sw_name, sw_fmt), (still_b, "main", "jpeg"))
+            self.assertEqual(
+                sw_cfg["controls"],
+                {"ScalerCrop": (820, 616, 1640, 1232), "ExposureValue": -0.5},
+            )
+            # Prior photo configuration restored and controls re-applied
+            self.assertEqual(picam.configured["main"]["size"], (3280, 2464))
+            self.assertGreater(len(picam.controls_history), controls_before)
+            self.assertEqual(
+                picam.controls_history[-1],
+                {"ScalerCrop": (820, 616, 1640, 1232), "ExposureValue": -0.5},
+            )
+
+            # 3rd capture: back at 3280x2464 -> still matches _main_size, uses direct capture_file
+            still_c = os.path.join(tmpdir, ".IMG_3.jpg.tmp")
+            res_c = worker.capture_still(still_c, 3280, 2464)
+            self.assertEqual(res_c["width"], 3280)
+            self.assertEqual(len(picam.switched_captures), 1)
+            self.assertEqual(picam.captured_files[-1], (still_c, "main", "jpeg"))
+
+    def test_capture_still_in_video_mode_switches_to_still_format(self):
+        worker, _, _ = self._make_worker()
+        worker.start()
+        picam = FakePicamera2.instances[-1]
+        worker.configure(
+            mode="video",
+            main_w=1280,
+            main_h=720,
+            preview_w=226,
+            preview_h=128,
+            fps=30,
+            zoom=2.0,
+            ev=0.5,
+            transform="0",
+        )
+        controls_before = len(picam.controls_history)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            still_path = os.path.join(tmpdir, ".IMG_from_video.jpg.tmp")
+            res = worker.capture_still(still_path, 1280, 720)
+            self.assertEqual(res["width"], 1280)
+            self.assertEqual(res["height"], 720)
+            # Even though 1280x720 matches video _main_size, video mode uses YUV420 so it must switch
+            self.assertEqual(len(picam.switched_captures), 1)
+            sw_cfg = picam.switched_captures[0][0]
+            self.assertEqual(sw_cfg["main"]["format"], "RGB888")
+            self.assertEqual(sw_cfg["controls"]["ExposureValue"], 0.5)
+            # Prior video configuration restored and 16:9 controls re-applied
+            self.assertEqual(picam.configured["type"], "video")
+            self.assertGreater(len(picam.controls_history), controls_before)
+            self.assertEqual(
+                picam.controls_history[-1],
+                {"ScalerCrop": (820, 770, 1640, 922), "ExposureValue": 0.5},
+            )
+
+    def test_configure_invalid_transform_preserves_state_and_safe_reconfigure_ordering(self):
+        worker, writer, _ = self._make_worker()
+        worker.start()
+        picam = FakePicamera2.instances[-1]
+        worker.configure(
+            mode="photo",
+            main_w=3280,
+            main_h=2464,
+            preview_w=226,
+            preview_h=170,
+            fps=30,
+            zoom=1.5,
+            ev=0.5,
+            transform="auto",
+        )
+        saved_config = dict(worker._last_config_kwargs)
+
+        with self.assertRaises(ValueError):
+            worker.configure(
+                mode="video",
+                main_w=1280,
+                main_h=720,
+                preview_w=226,
+                preview_h=128,
+                fps=30,
+                zoom=2.0,
+                ev=-1.0,
+                transform="bogus_rot",
+            )
+
+        # Camera remained started and prior state untouched on validation error
+        self.assertTrue(picam.started)
+        self.assertIsNotNone(picam.post_callback)
+        self.assertEqual(worker._mode, "photo")
+        self.assertEqual(worker._preview_size, (226, 170))
+        self.assertFalse(worker._is_16_9)
+        self.assertEqual(worker._last_config_kwargs, saved_config)
+
+        # Reconfigure photo -> video must detach post_callback and stop before starting video
+        picam.events.clear()
+        worker.configure(
+            mode="video",
+            main_w=1280,
+            main_h=720,
+            preview_w=226,
+            preview_h=128,
+            fps=30,
+            zoom=1.0,
+            ev=0.0,
+            transform="0",
+        )
+        self.assertEqual(
+            picam.events,
+            [("stop", True), ("configure", "video"), ("start", "video")],
+        )
+        picam.emit_lores_frame()
+        w, h, _, flags, _ = writer.frames[-1]
+        self.assertEqual((w, h, flags), (226, 128, FLAG_ASPECT_16_9))
+
+    def test_extract_lores_yuv420_negotiated_stride_with_trailing_padding(self):
+        worker, writer, _ = self._make_worker()
+        worker.start()
+        picam = FakePicamera2.instances[-1]
+        picam.negotiated_stride = 256
+        worker.configure(
+            mode="photo",
+            main_w=3280,
+            main_h=2464,
+            preview_w=226,
+            preview_h=170,
+            fps=30,
+            zoom=1.0,
+            ev=0.0,
+            transform="auto",
+        )
+        self.assertEqual(worker._lores_stride, 256)
+
+        # Emit frame with stride=256 and 512 trailing DMA alignment bytes
+        picam.emit_lores_frame(
+            stride=256,
+            trailing_bytes=512,
+            request_config={"lores": {"stride": 256}},
+        )
+        self.assertEqual(len(writer.frames), 1)
+        w, h, pixfmt, flags, payload = writer.frames[0]
+        self.assertEqual((w, h, pixfmt, flags), (226, 170, PIXFMT_YUV420, 0))
+        expected = 226 * 170 * 3 // 2
+        self.assertEqual(len(payload), expected)
+        self.assertNotIn(255, payload)
+        self.assertNotIn(0xAA, payload)
+        # Verify exact Y, U, V plane contents without row skew
+        y_len = 226 * 170
+        uv_len = 113 * 85
+        self.assertEqual(payload[:y_len], b"\x64" * y_len)
+        self.assertEqual(payload[y_len : y_len + uv_len], b"\x80" * uv_len)
+        self.assertEqual(payload[y_len + uv_len :], b"\x81" * uv_len)
 
 
 if __name__ == "__main__":
