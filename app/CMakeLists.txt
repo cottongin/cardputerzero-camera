@@ -35,6 +35,8 @@ add_library(czcamera_core STATIC
   src/storage.cpp
   src/filters.cpp
   src/jpeg_pipeline.cpp
+  src/subprocess_backend.cpp
+  src/sim_backend.cpp
 )
 
 target_include_directories(czcamera_core
@@ -91,4 +93,12 @@ if(CZ_BUILD_TESTS)
   target_compile_options(test_filters_and_jpeg PRIVATE -Wall -Wextra -Wpedantic)
   target_link_libraries(test_filters_and_jpeg PRIVATE czcamera_core)
   add_test(NAME test_filters_and_jpeg COMMAND test_filters_and_jpeg)
+
+  add_executable(test_backend_protocol tests/test_backend_protocol.cpp)
+  target_compile_options(test_backend_protocol PRIVATE -Wall -Wextra -Wpedantic)
+  target_compile_definitions(test_backend_protocol PRIVATE
+    CZ_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
+  )
+  target_link_libraries(test_backend_protocol PRIVATE czcamera_core)
+  add_test(NAME test_backend_protocol COMMAND test_backend_protocol)
 endif()
