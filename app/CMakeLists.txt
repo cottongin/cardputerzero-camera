@@ -10,7 +10,18 @@ option(CZ_TARGET_DEVICE "Build for CardputerZero Linux fbdev/evdev target" OFF)
 option(CZ_BUILD_TESTS "Build czcamera unit tests" ON)
 option(CZ_ENABLE_LVGL "Enable optional LVGL UI hook if available" OFF)
 
-find_package(JPEG REQUIRED)
+find_package(JPEG QUIET)
+if(NOT JPEG_FOUND)
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(LIBJPEG IMPORTED_TARGET libjpeg)
+  endif()
+  if(TARGET PkgConfig::LIBJPEG)
+    add_library(JPEG::JPEG ALIAS PkgConfig::LIBJPEG)
+  else()
+    find_package(JPEG REQUIRED)
+  endif()
+endif()
 find_package(Freetype QUIET)
 find_package(Threads REQUIRED)
 
@@ -22,6 +33,8 @@ add_library(czcamera_core STATIC
   src/theme.cpp
   src/config.cpp
   src/storage.cpp
+  src/filters.cpp
+  src/jpeg_pipeline.cpp
 )
 
 target_include_directories(czcamera_core
@@ -39,6 +52,7 @@ target_compile_options(czcamera_core
 target_link_libraries(czcamera_core
   PUBLIC
     Threads::Threads
+    JPEG::JPEG
 )
 
 if(Freetype_FOUND)
@@ -72,4 +86,9 @@ if(CZ_BUILD_TESTS)
   target_compile_options(test_config_and_storage PRIVATE -Wall -Wextra -Wpedantic)
   target_link_libraries(test_config_and_storage PRIVATE czcamera_core)
   add_test(NAME test_config_and_storage COMMAND test_config_and_storage)
+
+  add_executable(test_filters_and_jpeg tests/test_filters_and_jpeg.cpp)
+  target_compile_options(test_filters_and_jpeg PRIVATE -Wall -Wextra -Wpedantic)
+  target_link_libraries(test_filters_and_jpeg PRIVATE czcamera_core)
+  add_test(NAME test_filters_and_jpeg COMMAND test_filters_and_jpeg)
 endif()
