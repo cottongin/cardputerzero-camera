@@ -718,6 +718,10 @@ void test_video_player_decodes_frames_seeks_and_handles_silent_mp4() {
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
+  assert(af.seq > 0);
+  assert(pcm_samples.load() > 0);
+  player.stop();
+
   // Muted play(false) on audio MP4 skips pcm_sink and reaches EOF naturally
   pcm_samples.store(0);
   assert(player.open(audio_mp4, 226, 128));

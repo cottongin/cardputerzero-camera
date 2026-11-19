@@ -1229,11 +1229,16 @@ void VideoPlayer::video_worker_loop(double start_pos_sec,
 
   int status = 0;
   if (!stopped_by_caller && natural_eof) {
+    bool owns_pid = false;
     {
       std::lock_guard<std::mutex> plock(proc_mutex_);
       if (video_pid_ == child_pid) {
         video_pid_ = -1;
+        owns_pid = true;
       }
+    }
+    if (!owns_pid) {
+      return;
     }
     if (!media_detail::reap_pid_timeout(child_pid, 500, &status)) {
       pid_t tmp = child_pid;
