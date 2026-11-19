@@ -1,0 +1,77 @@
+#!/usr/bin/python3
+"""CLI entrypoint for czcamera-cam foreground camera worker."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import signal
+import sys
+from typing import Optional
+
+# Support both source-tree execution (cam-helper/bin/czcamera-cam)
+# and packaged installation (/usr/bin/czcamera-cam + /usr/lib/czcamera/czcamera_cam).
+_SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+_LOCAL_HELPER_DIR = os.path.dirname(_SCRIPT_DIR)
+_SYSTEM_LIB_DIR = "/usr/lib/czcamera"
+for _candidate in (_LOCAL_HELPER_DIR, _SYSTEM_LIB_DIR):
+    if os.path.isdir(os.path.join(_candidate, "czcamera_cam")) and _candidate not in sys.path:
+        sys.path.insert(0, _candidate)
+
+from czcamera_cam.picam2_worker import MockCameraDriver, Picam2Worker  # noqa: E402
+from czcamera_cam.protocol import FramePipeWriter, JsonProtocolServer  # noqa: E402
+
+
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="czcamera-cam",
+        description="Decoupled camera worker speaking Wire Protocol v1 + CZFR framing.",
+    )
+    parser.add_argument(
+        "--frame-fd",
+        type=int,
+        required=True,
+        help="Open writable file descriptor for CZFR binary preview frames.",
+    )
+    parser.add_argument(
+        "--mock-driver",
+        action="store_true",
+        help="Use synthetic MockCameraDriver instead of picamera2/libcamera.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = parse_args(argv)
+    frame_writer = FramePipeWriter(args.frame_fd, owns_fd=True)
+    frame_writer.start()
+
+    def build_worker(emit_event):
+        if args.mock_driver:
+            return MockCameraDriver(frame_writer=frame_writer, emit_event=emit_event)
+        return Picam2Worker(frame_writer=frame_writer, emit_event=emit_event)
+
+    server = JsonProtocolServer(
+        worker_factory=build_worker,
+        stdin=sys.stdin,
+        stdout=sys.stdout,
+    )
+
+    def _handle_signal(_signum: int, _frame: object) -> None:
+        server.request_shutdown()
+        try:
+            sys.stdin.close()
+        except OSError:
+            pass
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
+    try:
+        return server.run()
+    finally:
+        frame_writer.stop()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
