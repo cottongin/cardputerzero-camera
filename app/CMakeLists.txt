@@ -37,6 +37,10 @@ add_library(czcamera_core STATIC
   src/jpeg_pipeline.cpp
   src/subprocess_backend.cpp
   src/sim_backend.cpp
+  src/backlight.cpp
+  src/timelapse_engine.cpp
+  src/gallery_model.cpp
+  src/video_player.cpp
 )
 
 target_include_directories(czcamera_core
@@ -103,4 +107,9 @@ if(CZ_BUILD_TESTS)
   )
   target_link_libraries(test_backend_protocol PRIVATE czcamera_core)
   add_test(NAME test_backend_protocol COMMAND test_backend_protocol)
+
+  add_executable(test_timelapse_and_gallery tests/test_timelapse_and_gallery.cpp)
+  target_compile_options(test_timelapse_and_gallery PRIVATE -Wall -Wextra -Wpedantic)
+  target_link_libraries(test_timelapse_and_gallery PRIVATE czcamera_core)
+  add_test(NAME test_timelapse_and_gallery COMMAND test_timelapse_and_gallery)
 endif()
