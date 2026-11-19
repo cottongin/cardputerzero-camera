@@ -698,9 +698,8 @@ void UiController::adjust_rail_setting(int delta) {
         persist_config();
       } else if (state_.rail_cursor == 2) {
         adjust_zoom(step);
-      } else if (state_.rail_cursor == 3) {
-        adjust_ev(step);
       }
+      // Card 3 (FREE) is a read-only storage indicator.
       break;
     }
     case AppMode::Timelapse: {

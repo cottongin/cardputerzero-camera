@@ -273,6 +273,25 @@ void test_photo_controls_zoom_loupe_filters_and_timer() {
   assert(ctrl.consume_capture_flash());
   assert(count_files_with_ext(out_dir, ".jpg") == 2);
   assert(count_hidden_files(out_dir) == 0);
+
+  // Photo rail_cursor == 1 adjusts EV across [-2.0, +2.0] in 0.5 steps
+  assert(ctrl.state().rail_cursor == 1);
+  assert(ctrl.state().config.ev == 0.0);
+  for (int i = 1; i <= 5; ++i) {
+    ctrl.handle_key(0, cz::KeyCode::Right, now);
+  }
+  assert(ctrl.state().config.ev == 2.0);
+  assert(spy->last_ev == 2.0f);
+  for (int i = 1; i <= 9; ++i) {
+    ctrl.handle_key(0, cz::KeyCode::Left, now);
+  }
+  assert(ctrl.state().config.ev == -2.0);
+  assert(spy->last_ev == -2.0f);
+  for (int i = 1; i <= 4; ++i) {
+    ctrl.handle_key(0, cz::KeyCode::Right, now);
+  }
+  assert(ctrl.state().config.ev == 0.0);
+  assert(cz::load_config(cfg_path).ev == 0.0);
 }
 
 void test_rail_side_and_theme_toggles_persist() {
@@ -356,6 +375,22 @@ void test_video_mode_locks_transitions_while_recording() {
   assert(!ctrl.state().config.video_audio);
   ctrl.handle_key('M', cz::KeyCode::Char, now);
   assert(ctrl.state().config.video_audio);
+
+  // Video rail Card 3 (FREE) is read-only and must not mutate EV
+  const double ev_before = ctrl.state().config.ev;
+  while (ctrl.state().rail_cursor < 3) {
+    ctrl.handle_key(0, cz::KeyCode::Down, now);
+  }
+  assert(ctrl.state().rail_cursor == 3);
+  ctrl.handle_key(0, cz::KeyCode::Left, now);
+  assert(ctrl.state().config.ev == ev_before);
+  ctrl.handle_key(0, cz::KeyCode::Right, now);
+  assert(ctrl.state().config.ev == ev_before);
+  ctrl.handle_key('h', cz::KeyCode::Char, now);
+  assert(ctrl.state().config.ev == ev_before);
+  ctrl.handle_key('l', cz::KeyCode::Char, now);
+  assert(ctrl.state().config.ev == ev_before);
+  assert(cz::load_config(cfg_path).ev == ev_before);
 
   // Start recording with Enter
   ctrl.handle_key(0, cz::KeyCode::Enter, now);
