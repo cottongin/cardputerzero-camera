@@ -807,18 +807,22 @@ struct AppView::Impl {
     constexpr int kVfH = 170;
     canvas.fill_rect(vf_x, 0, kVfW, kVfH, pal.viewfinder_surround);
 
+    const bool show_live_frame =
+        state.backend_ready && !state.backend_paused && live_frame != nullptr &&
+        !live_frame->rgb24.empty() && live_frame->width > 0 &&
+        live_frame->height > 0;
+
     const bool is_16_9 =
         (state.mode == AppMode::Video) ||
         (state.mode == AppMode::Timelapse &&
          state.config.timelapse_resolution == "1080p") ||
-        (live_frame != nullptr && live_frame->is_16_9);
+        (show_live_frame && live_frame->is_16_9);
 
     const int feed_w = kVfW;
     const int feed_h = is_16_9 ? 127 : kVfH;
     const int feed_y = is_16_9 ? 21 : 0;
 
-    if (live_frame != nullptr && !live_frame->rgb24.empty() &&
-        live_frame->width > 0 && live_frame->height > 0) {
+    if (show_live_frame) {
       scaled_vf.resize(static_cast<size_t>(feed_w) * static_cast<size_t>(feed_h) *
                        3u);
       const float loupe =

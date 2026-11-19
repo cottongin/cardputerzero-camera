@@ -59,7 +59,7 @@ class FramePipeWriter:
         self._fd = frame_fd
         self._owns_fd = owns_fd
         self._cond = threading.Condition()
-        self._pending: Optional[tuple[int, int, int, int, bytes]] = None
+        self._pending: Optional[bytes] = None
         self._stop = False
         self._started = False
         self._thread: Optional[threading.Thread] = None
@@ -110,14 +110,25 @@ class FramePipeWriter:
     ) -> None:
         """Queue the latest frame without blocking; drop any stale queued frame."""
         data = bytes(payload)
+        header = pack_czfr_header(width, height, pixfmt, flags, len(data))
+        packet = header + data
         with self._cond:
             if self._stop:
                 return
             if self._pending is not None:
                 self._frames_dropped += 1
-            self._pending = (width, height, pixfmt, flags, data)
+            self._pending = packet
             self._frames_pushed += 1
             self._cond.notify()
+
+    def _close_fd_locked(self) -> None:
+        if self._owns_fd and self._fd >= 0:
+            fd = self._fd
+            self._fd = -1
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
     def stop(self, timeout: float = 1.0) -> None:
         with self._cond:
@@ -128,14 +139,10 @@ class FramePipeWriter:
         if thread is not None and thread.is_alive():
             thread.join(timeout=timeout)
         with self._cond:
-            self._thread = None
-            self._started = False
-        if self._owns_fd and self._fd >= 0:
-            try:
-                os.close(self._fd)
-            except OSError:
-                pass
-            self._fd = -1
+            if thread is None or not thread.is_alive():
+                self._thread = None
+                self._started = False
+                self._close_fd_locked()
 
     def _write_packet(self, packet: bytes) -> bool:
         mv = memoryview(packet)
@@ -144,12 +151,24 @@ class FramePipeWriter:
         try:
             while offset < total:
                 with self._cond:
-                    if self._stop:
+                    if self._stop or self._fd < 0:
                         return False
+                    fd = self._fd
                 try:
-                    written = os.write(self._fd, mv[offset:])
+                    written = os.write(fd, mv[offset:])
                 except BlockingIOError:
-                    select.select([], [self._fd], [], 0.05)
+                    while True:
+                        with self._cond:
+                            if self._stop or self._fd < 0:
+                                return False
+                            fd = self._fd
+                        try:
+                            select.select([], [fd], [], 0.05)
+                            break
+                        except InterruptedError:
+                            continue
+                        except (OSError, ValueError):
+                            return False
                     continue
                 except (BrokenPipeError, OSError):
                     return False
@@ -161,24 +180,29 @@ class FramePipeWriter:
             mv.release()
 
     def _writer_loop(self) -> None:
-        while True:
-            with self._cond:
-                while self._pending is None and not self._stop:
-                    self._cond.wait()
-                if self._stop:
-                    return
-                frame = self._pending
-                self._pending = None
-
-            assert frame is not None
-            width, height, pixfmt, flags, payload = frame
-            header = pack_czfr_header(width, height, pixfmt, flags, len(payload))
-            if not self._write_packet(header + payload):
+        try:
+            while True:
                 with self._cond:
-                    self._stop = True
-                return
+                    while self._pending is None and not self._stop:
+                        self._cond.wait()
+                    if self._stop:
+                        return
+                    packet = self._pending
+                    self._pending = None
+
+                assert packet is not None
+                if not self._write_packet(packet):
+                    with self._cond:
+                        self._stop = True
+                    return
+                with self._cond:
+                    self._frames_written += 1
+        finally:
             with self._cond:
-                self._frames_written += 1
+                self._started = False
+                self._thread = None
+                if self._stop:
+                    self._close_fd_locked()
 
 
 class JsonProtocolServer:
@@ -338,10 +362,10 @@ class JsonProtocolServer:
                 buf.extend(chunk)
 
     def run(self) -> int:
-        self._worker.start()
         stdin_fd = self._get_stdin_fd() if self._wakeup_fd is not None else None
         fd_buf = bytearray()
         try:
+            self._worker.start()
             while not self._shutdown_requested:
                 if stdin_fd is not None and self._wakeup_fd is not None:
                     raw_line = self._read_line_fd(stdin_fd, self._wakeup_fd, fd_buf)

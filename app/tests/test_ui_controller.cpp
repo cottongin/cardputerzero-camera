@@ -1,5 +1,6 @@
 #include "app_ui.hpp"
 #include "config.hpp"
+#include "evdev_repeat_guard.hpp"
 #include "sim_backend.hpp"
 #include "storage.hpp"
 #include "ui_controller.hpp"
@@ -144,6 +145,74 @@ class SpyCameraBackend final : public cz::ICameraBackend {
   int pause_calls = 0;
   int resume_calls = 0;
   int capture_still_calls = 0;
+
+ private:
+  cz::SimCameraBackend inner_;
+};
+
+class DropSimBackend final : public cz::ICameraBackend {
+ public:
+  bool start(const cz::CameraStreamSpec& initial_spec,
+             std::string& out_err) override {
+    if (fail_start) {
+      out_err = "Simulated camera start failure";
+      return false;
+    }
+    force_offline = false;
+    forced_error.clear();
+    return inner_.start(initial_spec, out_err);
+  }
+
+  void stop() override { inner_.stop(); }
+
+  bool reconfigure(const cz::CameraStreamSpec& spec,
+                   std::string& out_err) override {
+    return inner_.reconfigure(spec, out_err);
+  }
+
+  bool set_controls(float zoom, float ev, std::string& out_err) override {
+    return inner_.set_controls(zoom, ev, out_err);
+  }
+
+  bool pause(std::string& out_err) override { return inner_.pause(out_err); }
+
+  bool resume(std::string& out_err) override { return inner_.resume(out_err); }
+
+  bool copy_latest_preview(uint64_t last_seen_seq,
+                           cz::PreviewFrame& out_frame) override {
+    return inner_.copy_latest_preview(last_seen_seq, out_frame);
+  }
+
+  cz::StillCaptureResult capture_still(const std::string& tmp_jpeg_path,
+                                       int width,
+                                       int height) override {
+    return inner_.capture_still(tmp_jpeg_path, width, height);
+  }
+
+  bool start_video(const cz::VideoSpec& spec, std::string& out_err) override {
+    return inner_.start_video(spec, out_err);
+  }
+
+  cz::VideoStopResult stop_video() override { return inner_.stop_video(); }
+
+  cz::BackendHealth status() const override {
+    cz::BackendHealth h = inner_.status();
+    if (force_offline) {
+      h.ready = false;
+      h.recording = false;
+      h.last_error = forced_error;
+    }
+    return h;
+  }
+
+  void simulate_drop(const std::string& err) {
+    force_offline = true;
+    forced_error = err;
+  }
+
+  bool fail_start = false;
+  bool force_offline = false;
+  std::string forced_error;
 
  private:
   cz::SimCameraBackend inner_;
@@ -791,6 +860,249 @@ void test_text_input_timelapse_custom_recovery_and_modal_renders() {
   }
 }
 
+void test_backend_drop_toast_and_stale_live_frame_rendering() {
+  TempDir tmp("backend_drop");
+  const std::string cfg_path = tmp.path + "/config.json";
+  const std::string out_dir = tmp.path + "/out";
+  assert(cz::mkdir_p(out_dir));
+
+  cz::AppConfig cfg;
+  cfg.output_dir = out_dir;
+  assert(cz::save_config(cfg, cfg_path));
+
+  cz::UiControllerOptions opts;
+  opts.config_path = cfg_path;
+  opts.backlight_sysfs_root = tmp.path + "/no_backlight";
+  opts.skip_startup_recovery_scan = true;
+
+  // 1. Initial startup failure surfaces startup toast once without spurious repeats
+  {
+    auto fail_owned = std::make_unique<DropSimBackend>();
+    fail_owned->fail_start = true;
+    cz::UiController ctrl(std::move(fail_owned), opts);
+    uint64_t now = 1000;
+    assert(ctrl.init(now));
+    assert(!ctrl.state().backend_ready);
+    assert(ctrl.state().toast_is_error);
+    assert(ctrl.state().toast_message == "Simulated camera start failure");
+    now += 4000;
+    ctrl.tick(now);
+    assert(ctrl.state().toast_message.empty());
+  }
+
+  // 2. Unexpected true -> false drop emits error toast, and offline/paused
+  //    render cleanly even when a non-null stale live_frame is passed.
+  auto drop_owned = std::make_unique<DropSimBackend>();
+  DropSimBackend* drop = drop_owned.get();
+  cz::UiController ctrl(std::move(drop_owned), opts);
+  uint64_t now = 1000;
+  assert(ctrl.init(now));
+  assert(ctrl.state().backend_ready);
+  assert(!ctrl.state().backend_paused);
+  assert(ctrl.state().toast_message.empty());
+
+  cz::PreviewFrame live;
+  assert(ctrl.backend()->copy_latest_preview(0, live));
+  assert(!live.rgb24.empty());
+
+  cz::AppView view;
+  view.apply_theme(ctrl.state().theme);
+  view.render(ctrl.state(), &live, nullptr);
+  const std::vector<uint32_t> live_pixels(
+      view.pixels(),
+      view.pixels() + cz::AppView::kWidth * cz::AppView::kHeight);
+
+  // Stale 16:9 flag in stale live_frame must not affect offline/paused Photo layout
+  cz::PreviewFrame stale_16_9 = live;
+  stale_16_9.is_16_9 = true;
+
+  cz::UiState offline_state = ctrl.state();
+  offline_state.backend_ready = false;
+  offline_state.backend_paused = false;
+  view.render(offline_state, &live, nullptr);
+  const std::vector<uint32_t> offline_with_4_3(
+      view.pixels(),
+      view.pixels() + cz::AppView::kWidth * cz::AppView::kHeight);
+  view.render(offline_state, &stale_16_9, nullptr);
+  const std::vector<uint32_t> offline_with_stale(
+      view.pixels(),
+      view.pixels() + cz::AppView::kWidth * cz::AppView::kHeight);
+  view.render(offline_state, nullptr, nullptr);
+  const std::vector<uint32_t> offline_with_null(
+      view.pixels(),
+      view.pixels() + cz::AppView::kWidth * cz::AppView::kHeight);
+  assert(offline_with_4_3 != live_pixels);
+  assert(offline_with_4_3 == offline_with_null);
+  assert(offline_with_stale != live_pixels);
+  assert(offline_with_stale == offline_with_null);
+
+  cz::UiState paused_state = ctrl.state();
+  paused_state.backend_ready = true;
+  paused_state.backend_paused = true;
+  view.render(paused_state, &live, nullptr);
+  const std::vector<uint32_t> paused_with_4_3(
+      view.pixels(),
+      view.pixels() + cz::AppView::kWidth * cz::AppView::kHeight);
+  view.render(paused_state, &stale_16_9, nullptr);
+  const std::vector<uint32_t> paused_with_stale(
+      view.pixels(),
+      view.pixels() + cz::AppView::kWidth * cz::AppView::kHeight);
+  view.render(paused_state, nullptr, nullptr);
+  const std::vector<uint32_t> paused_with_null(
+      view.pixels(),
+      view.pixels() + cz::AppView::kWidth * cz::AppView::kHeight);
+  assert(paused_with_4_3 != live_pixels);
+  assert(paused_with_4_3 == paused_with_null);
+  assert(paused_with_stale != live_pixels);
+  assert(paused_with_stale != offline_with_stale);
+  assert(paused_with_stale == paused_with_null);
+
+  // Trigger unexpected backend drop with descriptive backend error
+  drop->simulate_drop("czcamera-cam exited unexpectedly (code 1)");
+  now += 100;
+  ctrl.tick(now);
+  assert(!ctrl.state().backend_ready);
+  assert(ctrl.state().toast_is_error);
+  assert(ctrl.state().toast_message ==
+         "czcamera-cam exited unexpectedly (code 1)");
+
+  // Recover via [R], verify fallback "Camera offline" when last_error is empty
+  now += 100;
+  ctrl.handle_key('r', cz::KeyCode::Char, now);
+  assert(ctrl.state().backend_ready);
+  assert(ctrl.state().toast_message == "Camera recovered");
+  now += 4000;
+  ctrl.tick(now);
+  assert(ctrl.state().toast_message.empty());
+
+  drop->simulate_drop("");
+  now += 100;
+  ctrl.tick(now);
+  assert(!ctrl.state().backend_ready);
+  assert(ctrl.state().toast_is_error);
+  assert(ctrl.state().toast_message == "Camera offline");
+
+  // Recover and confirm shutdown() leaves no spurious error toast
+  now += 100;
+  ctrl.handle_key('r', cz::KeyCode::Char, now);
+  assert(ctrl.state().backend_ready);
+  now += 4000;
+  ctrl.tick(now);
+  assert(ctrl.state().toast_message.empty());
+  ctrl.shutdown();
+  assert(!ctrl.state().backend_ready);
+  assert(ctrl.state().toast_message.empty());
+}
+
+void test_timelapse_photos_auto_finish_clears_stop_confirm_modal() {
+  TempDir tmp("tl_stop_confirm_autofinish");
+  const std::string cfg_path = tmp.path + "/config.json";
+  const std::string out_dir = tmp.path + "/out";
+  assert(cz::mkdir_p(out_dir));
+
+  cz::AppConfig cfg;
+  cfg.output_dir = out_dir;
+  cfg.timelapse_output_mode = "photos";
+  cfg.timelapse_interval_sec = 2;
+  cfg.timelapse_stop_mode = "shots";
+  cfg.timelapse_stop_value = 2;
+  assert(cz::save_config(cfg, cfg_path));
+
+  cz::UiControllerOptions opts;
+  opts.config_path = cfg_path;
+  opts.backlight_sysfs_root = tmp.path + "/no_backlight";
+  opts.skip_startup_recovery_scan = true;
+
+  cz::UiController ctrl(std::make_unique<cz::SimCameraBackend>(), opts);
+  uint64_t now = 1000;
+  assert(ctrl.init(now));
+
+  ctrl.handle_key('3', cz::KeyCode::Char, now);
+  assert(ctrl.state().mode == cz::AppMode::Timelapse);
+  ctrl.handle_key(0, cz::KeyCode::Enter, now);
+  ctrl.tick(now);
+  assert(ctrl.state().timelapse.running);
+  assert(ctrl.state().timelapse.shots_taken == 1);
+
+  // Open Stop Confirm modal while Photos-mode timelapse is active
+  now += 100;
+  ctrl.handle_key(0, cz::KeyCode::Esc, now);
+  assert(ctrl.state().modal == cz::OverlayModal::TimelapseStopConfirm);
+
+  // Tick past the 2-shot stop limit; modal must clear automatically
+  now += 2500;
+  ctrl.tick(now);
+  assert(!ctrl.state().timelapse.running);
+  assert(!ctrl.state().timelapse.needs_compile);
+  assert(ctrl.state().timelapse.shots_taken == 2);
+  assert(ctrl.state().modal == cz::OverlayModal::None);
+}
+
+void test_evdev_repeat_guard_suppresses_wake_key_repeats() {
+  TempDir tmp("evdev_repeat_guard");
+  const std::string cfg_path = tmp.path + "/config.json";
+  const std::string out_dir = tmp.path + "/out";
+  const std::string bl_root = tmp.path + "/backlight";
+  const std::string lcd0 = bl_root + "/lcd0";
+  assert(cz::mkdir_p(out_dir));
+  assert(cz::mkdir_p(lcd0));
+  write_text(lcd0 + "/brightness", "128\n");
+  write_text(lcd0 + "/max_brightness", "255\n");
+
+  cz::AppConfig cfg;
+  cfg.output_dir = out_dir;
+  cfg.timelapse_dim_sec = 5;
+  cfg.timelapse_interval_sec = 4;
+  cfg.timelapse_output_mode = "photos";
+  assert(cz::save_config(cfg, cfg_path));
+
+  cz::UiControllerOptions opts;
+  opts.config_path = cfg_path;
+  opts.backlight_sysfs_root = bl_root;
+  opts.skip_startup_recovery_scan = true;
+
+  cz::UiController ctrl(std::make_unique<cz::SimCameraBackend>(), opts);
+  uint64_t now = 1000;
+  assert(ctrl.init(now));
+
+  ctrl.handle_key('3', cz::KeyCode::Char, now);
+  ctrl.handle_key(0, cz::KeyCode::Enter, now);
+  ctrl.tick(now);
+  assert(ctrl.state().timelapse.running);
+
+  now += 6000;
+  ctrl.tick(now);
+  assert(ctrl.state().timelapse_dimmed);
+
+  cz::EvdevRepeatGuard guard;
+  constexpr uint16_t kKeyEsc = 1;
+  constexpr uint16_t kKeyDown = 108;
+
+  // Initial press (value=1) while dimmed wakes LCD and arms repeat suppression
+  assert(guard.should_dispatch(kKeyEsc, 1, ctrl.state().timelapse_dimmed));
+  ctrl.handle_key(0, cz::KeyCode::Esc, now);
+  assert(!ctrl.state().timelapse_dimmed);
+  assert(ctrl.state().modal == cz::OverlayModal::None);
+
+  // Kernel auto-repeats (value=2) while key stays held must be suppressed
+  now += 250;
+  assert(!guard.should_dispatch(kKeyEsc, 2, ctrl.state().timelapse_dimmed));
+  assert(!guard.should_dispatch(kKeyEsc, 2, ctrl.state().timelapse_dimmed));
+  assert(ctrl.state().modal == cz::OverlayModal::None);
+
+  // Normal repeats for a key pressed while awake still dispatch
+  assert(guard.should_dispatch(kKeyDown, 1, ctrl.state().timelapse_dimmed));
+  assert(guard.should_dispatch(kKeyDown, 2, ctrl.state().timelapse_dimmed));
+  assert(!guard.should_dispatch(kKeyDown, 0, ctrl.state().timelapse_dimmed));
+
+  // Key release (value=0) clears suppression; next fresh press opens modal
+  assert(!guard.should_dispatch(kKeyEsc, 0, ctrl.state().timelapse_dimmed));
+  now += 50;
+  assert(guard.should_dispatch(kKeyEsc, 1, ctrl.state().timelapse_dimmed));
+  ctrl.handle_key(0, cz::KeyCode::Esc, now);
+  assert(ctrl.state().modal == cz::OverlayModal::TimelapseStopConfirm);
+}
+
 }  // namespace
 
 int main() {
@@ -800,6 +1112,9 @@ int main() {
   test_timelapse_dimmed_safe_wake();
   test_settings_dir_picker_camera_orient_and_gallery_delete();
   test_text_input_timelapse_custom_recovery_and_modal_renders();
+  test_backend_drop_toast_and_stale_live_frame_rendering();
+  test_timelapse_photos_auto_finish_clears_stop_confirm_modal();
+  test_evdev_repeat_guard_suppresses_wake_key_repeats();
   std::cout << "test_ui_controller: ALL PASSED\n";
   return 0;
 }

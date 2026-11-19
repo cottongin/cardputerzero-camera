@@ -220,6 +220,7 @@ bool UiController::init(uint64_t now_ms) {
     return true;
   }
 
+  last_now_ms_ = now_ms;
   state_.config = load_config(opts_.config_path);
   persisted_output_dir_ = state_.config.output_dir;
 
@@ -278,6 +279,8 @@ void UiController::shutdown() {
   if (backend_) {
     backend_->stop();
   }
+  state_.backend_ready = false;
+  state_.backend_paused = false;
   initialized_ = false;
 }
 
@@ -351,9 +354,13 @@ bool UiController::reconfigure_backend(std::string& out_err) {
 }
 
 void UiController::sync_backend_status() {
+  const bool was_ready = state_.backend_ready;
   if (!backend_) {
     state_.backend_ready = false;
     state_.backend_paused = false;
+    if (initialized_ && was_ready) {
+      set_toast("Camera offline", true, last_now_ms_);
+    }
     return;
   }
   const BackendHealth h = backend_->status();
@@ -363,6 +370,15 @@ void UiController::sync_backend_status() {
     state_.backend_error = h.last_error;
   } else if (h.ready) {
     state_.backend_error.clear();
+  }
+
+  if (initialized_ && was_ready && !h.ready && !state_.backend_paused) {
+    const std::string msg =
+        !h.last_error.empty()
+            ? h.last_error
+            : (!state_.backend_error.empty() ? state_.backend_error
+                                             : "Camera offline");
+    set_toast(msg, true, last_now_ms_);
   }
 }
 
@@ -505,6 +521,7 @@ void UiController::tick(uint64_t now_ms) {
   if (!initialized_) {
     init(now_ms);
   }
+  last_now_ms_ = now_ms;
 
   if (state_.capture_flash_active && now_ms >= flash_until_ms_) {
     state_.capture_flash_active = false;
@@ -557,6 +574,9 @@ void UiController::tick(uint64_t now_ms) {
     if (!state_.timelapse.running) {
       backlight_.restore();
       state_.timelapse_dimmed = false;
+      if (state_.modal == OverlayModal::TimelapseStopConfirm) {
+        state_.modal = OverlayModal::None;
+      }
       refresh_storage_stats();
 
       if (state_.timelapse.needs_compile && !compile_in_flight_.load()) {
@@ -1115,6 +1135,7 @@ bool UiController::handle_key(char ch, KeyCode code, uint64_t now_ms) {
     init(now_ms);
   }
 
+  last_now_ms_ = now_ms;
   last_activity_ms_ = now_ms;
 
   // Safe Wake Rule (Review Focus #2): any key while dimmed ONLY wakes backlight.

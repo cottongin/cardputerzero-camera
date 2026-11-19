@@ -1,5 +1,6 @@
 #include "app_ui.hpp"
 #include "camera_backend.hpp"
+#include "evdev_repeat_guard.hpp"
 #include "fb_blit.hpp"
 #include "storage.hpp"
 #include "ui_controller.hpp"
@@ -81,6 +82,89 @@ struct CliOptions {
   std::string rail_override;
 };
 
+struct RenderDirtyTracker {
+  uint64_t gal_seq = 0;
+  double vp_pos = -1.0;
+  bool vp_playing = false;
+  bool flash = false;
+  bool dimmed = false;
+  bool backend_ready = false;
+  bool backend_paused = false;
+  bool tl_running = false;
+  int tl_shots = 0;
+  int tl_next = 0;
+  int tl_elapsed = 0;
+  int vid_sec = 0;
+  int timer_sec = 0;
+  int comp_cur = 0;
+  std::string toast;
+  cz::OverlayModal modal = cz::OverlayModal::None;
+
+  void sync(const cz::UiState& st, uint64_t cur_gal_seq) {
+    gal_seq = cur_gal_seq;
+    vp_pos = st.video_player.position_sec;
+    vp_playing = st.video_player.playing;
+    flash = st.capture_flash_active;
+    dimmed = st.timelapse_dimmed;
+    backend_ready = st.backend_ready;
+    backend_paused = st.backend_paused;
+    tl_running = st.timelapse.running;
+    tl_shots = st.timelapse.shots_taken;
+    tl_next = st.timelapse.next_shot_in_sec;
+    tl_elapsed = st.timelapse.elapsed_sec;
+    vid_sec = st.video_elapsed_sec;
+    timer_sec = st.timer_remaining_sec;
+    comp_cur = st.timelapse.compile_current;
+    toast = st.toast_message;
+    modal = st.modal;
+  }
+
+  bool changed(const cz::UiState& st, uint64_t cur_gal_seq) const {
+    return cur_gal_seq != gal_seq ||
+           st.video_player.position_sec != vp_pos ||
+           st.video_player.playing != vp_playing ||
+           st.capture_flash_active != flash ||
+           st.timelapse_dimmed != dimmed ||
+           st.backend_ready != backend_ready ||
+           st.backend_paused != backend_paused ||
+           st.timelapse.running != tl_running ||
+           st.timelapse.shots_taken != tl_shots ||
+           st.timelapse.next_shot_in_sec != tl_next ||
+           st.timelapse.elapsed_sec != tl_elapsed ||
+           st.video_elapsed_sec != vid_sec ||
+           st.timer_remaining_sec != timer_sec ||
+           st.timelapse.compile_current != comp_cur ||
+           st.toast_message != toast ||
+           st.modal != modal;
+  }
+};
+
+void poll_live_frame_state(cz::UiController& ctrl,
+                           uint64_t& last_live_seq,
+                           cz::PreviewFrame& live_frame,
+                           bool& dirty) {
+  const auto& st = ctrl.state();
+  if (!st.backend_ready || st.backend_paused) {
+    if (!live_frame.rgb24.empty()) {
+      live_frame = cz::PreviewFrame{};
+      dirty = true;
+    }
+    return;
+  }
+  if (ctrl.backend() && st.modal != cz::OverlayModal::Gallery) {
+    if (ctrl.backend()->copy_latest_preview(last_live_seq, live_frame)) {
+      last_live_seq = live_frame.seq;
+      dirty = true;
+    }
+  }
+}
+
+const cz::PreviewFrame* effective_live_frame(
+    const cz::UiState& st,
+    const cz::PreviewFrame& live_frame) {
+  return (st.backend_ready && !st.backend_paused) ? &live_frame : nullptr;
+}
+
 int run_render_test(const CliOptions& cli) {
   ScopedTempDir temp_dir;
   std::string eff_out = cli.output_dir;
@@ -149,7 +233,8 @@ int run_render_test(const CliOptions& cli) {
 
   cz::AppView view;
   view.apply_theme(ctrl.state().theme);
-  view.render(ctrl.state(), &live_frame, ctrl.gallery_preview());
+  view.render(ctrl.state(), effective_live_frame(ctrl.state(), live_frame),
+              ctrl.gallery_preview());
   const bool ok = view.save_ppm(cli.render_test_path);
 
   ctrl.shutdown();
@@ -317,30 +402,23 @@ int run_device_loop(cz::UiController& ctrl, cz::AppView& view) {
 
   cz::PreviewFrame live_frame;
   uint64_t last_live_seq = 0;
-  uint64_t last_gal_seq = 0;
-  double last_vp_pos = -1.0;
-  bool last_vp_playing = false;
 
   view.apply_theme(ctrl.state().theme);
-  if (ctrl.backend()) {
+  if (ctrl.backend() && ctrl.state().backend_ready &&
+      !ctrl.state().backend_paused) {
     if (ctrl.backend()->copy_latest_preview(last_live_seq, live_frame)) {
       last_live_seq = live_frame.seq;
     }
   }
-  view.render(ctrl.state(), &live_frame, ctrl.gallery_preview());
+  const cz::PreviewFrame* init_gp = ctrl.gallery_preview();
+  view.render(ctrl.state(), effective_live_frame(ctrl.state(), live_frame),
+              init_gp);
   blit_fbdev(fb_mem, map_size, vinfo, finfo, view.pixels());
 
   bool shift_down = false;
-  bool prev_flash = ctrl.state().capture_flash_active;
-  bool prev_dimmed = ctrl.state().timelapse_dimmed;
-  int prev_tl_shots = ctrl.state().timelapse.shots_taken;
-  int prev_tl_next = ctrl.state().timelapse.next_shot_in_sec;
-  int prev_tl_elapsed = ctrl.state().timelapse.elapsed_sec;
-  int prev_vid_sec = ctrl.state().video_elapsed_sec;
-  int prev_timer_sec = ctrl.state().timer_remaining_sec;
-  int prev_comp_cur = ctrl.state().timelapse.compile_current;
-  std::string prev_toast = ctrl.state().toast_message;
-  cz::OverlayModal prev_modal = ctrl.state().modal;
+  cz::EvdevRepeatGuard repeat_guard;
+  RenderDirtyTracker dirty_tracker;
+  dirty_tracker.sync(ctrl.state(), init_gp ? init_gp->seq : 0);
 
   while (!ctrl.should_quit() && !g_signal_stop) {
     bool dirty = false;
@@ -380,7 +458,8 @@ int run_device_loop(cz::UiController& ctrl, cz::AppView& view) {
                 shift_down = (ev.value != 0);
                 continue;
               }
-              if (ev.value != 1 && ev.value != 2) {
+              if (!repeat_guard.should_dispatch(
+                      ev.code, ev.value, ctrl.state().timelapse_dimmed)) {
                 continue;
               }
               const uint64_t now = steady_now_ms();
@@ -447,46 +526,18 @@ int run_device_loop(cz::UiController& ctrl, cz::AppView& view) {
     const uint64_t now = steady_now_ms();
     ctrl.tick(now);
 
-    if (ctrl.backend() && ctrl.state().modal != cz::OverlayModal::Gallery) {
-      if (ctrl.backend()->copy_latest_preview(last_live_seq, live_frame)) {
-        last_live_seq = live_frame.seq;
-        dirty = true;
-      }
-    }
+    poll_live_frame_state(ctrl, last_live_seq, live_frame, dirty);
 
     const cz::PreviewFrame* gp = ctrl.gallery_preview();
     const uint64_t gal_seq = gp ? gp->seq : 0;
     const auto& st = ctrl.state();
-    if (gal_seq != last_gal_seq || st.video_player.position_sec != last_vp_pos ||
-        st.video_player.playing != last_vp_playing ||
-        st.capture_flash_active != prev_flash ||
-        st.timelapse_dimmed != prev_dimmed ||
-        st.timelapse.shots_taken != prev_tl_shots ||
-        st.timelapse.next_shot_in_sec != prev_tl_next ||
-        st.timelapse.elapsed_sec != prev_tl_elapsed ||
-        st.video_elapsed_sec != prev_vid_sec ||
-        st.timer_remaining_sec != prev_timer_sec ||
-        st.timelapse.compile_current != prev_comp_cur ||
-        st.toast_message != prev_toast || st.modal != prev_modal) {
+    if (dirty_tracker.changed(st, gal_seq)) {
       dirty = true;
     }
 
     if (dirty) {
-      last_gal_seq = gal_seq;
-      last_vp_pos = st.video_player.position_sec;
-      last_vp_playing = st.video_player.playing;
-      prev_flash = st.capture_flash_active;
-      prev_dimmed = st.timelapse_dimmed;
-      prev_tl_shots = st.timelapse.shots_taken;
-      prev_tl_next = st.timelapse.next_shot_in_sec;
-      prev_tl_elapsed = st.timelapse.elapsed_sec;
-      prev_vid_sec = st.video_elapsed_sec;
-      prev_timer_sec = st.timer_remaining_sec;
-      prev_comp_cur = st.timelapse.compile_current;
-      prev_toast = st.toast_message;
-      prev_modal = st.modal;
-
-      view.render(st, &live_frame, gp);
+      dirty_tracker.sync(st, gal_seq);
+      view.render(st, effective_live_frame(st, live_frame), gp);
       blit_fbdev(fb_mem, map_size, vinfo, finfo, view.pixels());
     }
   }
@@ -573,17 +624,17 @@ int run_sdl_loop(cz::UiController& ctrl, cz::AppView& view, int scale) {
 
   cz::PreviewFrame live_frame;
   uint64_t last_live_seq = 0;
-  uint64_t last_gal_seq = 0;
-  double last_vp_pos = -1.0;
-  bool last_vp_playing = false;
 
   view.apply_theme(ctrl.state().theme);
-  if (ctrl.backend()) {
+  if (ctrl.backend() && ctrl.state().backend_ready &&
+      !ctrl.state().backend_paused) {
     if (ctrl.backend()->copy_latest_preview(last_live_seq, live_frame)) {
       last_live_seq = live_frame.seq;
     }
   }
-  view.render(ctrl.state(), &live_frame, ctrl.gallery_preview());
+  const cz::PreviewFrame* init_gp = ctrl.gallery_preview();
+  view.render(ctrl.state(), effective_live_frame(ctrl.state(), live_frame),
+              init_gp);
 
   auto present = [&]() {
     SDL_UpdateTexture(texture, nullptr, view.pixels(),
@@ -595,16 +646,8 @@ int run_sdl_loop(cz::UiController& ctrl, cz::AppView& view, int scale) {
   present();
 
   bool running = true;
-  bool prev_flash = ctrl.state().capture_flash_active;
-  bool prev_dimmed = ctrl.state().timelapse_dimmed;
-  int prev_tl_shots = ctrl.state().timelapse.shots_taken;
-  int prev_tl_next = ctrl.state().timelapse.next_shot_in_sec;
-  int prev_tl_elapsed = ctrl.state().timelapse.elapsed_sec;
-  int prev_vid_sec = ctrl.state().video_elapsed_sec;
-  int prev_timer_sec = ctrl.state().timer_remaining_sec;
-  int prev_comp_cur = ctrl.state().timelapse.compile_current;
-  std::string prev_toast = ctrl.state().toast_message;
-  cz::OverlayModal prev_modal = ctrl.state().modal;
+  RenderDirtyTracker dirty_tracker;
+  dirty_tracker.sync(ctrl.state(), init_gp ? init_gp->seq : 0);
 
   while (running && !ctrl.should_quit() && !g_signal_stop) {
     bool dirty = false;
@@ -685,54 +728,27 @@ int run_sdl_loop(cz::UiController& ctrl, cz::AppView& view, int scale) {
     const uint64_t now = steady_now_ms();
     ctrl.tick(now);
 
-    if (ctrl.backend() && ctrl.state().modal != cz::OverlayModal::Gallery) {
-      if (ctrl.backend()->copy_latest_preview(last_live_seq, live_frame)) {
-        last_live_seq = live_frame.seq;
-        dirty = true;
-      }
-    }
+    poll_live_frame_state(ctrl, last_live_seq, live_frame, dirty);
 
     const auto& st = ctrl.state();
     if (audio_dev != 0) {
-      if ((!st.video_player.playing && last_vp_playing) ||
+      if ((!st.video_player.playing && dirty_tracker.vp_playing) ||
           (st.video_player.playing &&
-           std::abs(st.video_player.position_sec - last_vp_pos) > 0.45)) {
+           std::abs(st.video_player.position_sec - dirty_tracker.vp_pos) >
+               0.45)) {
         SDL_ClearQueuedAudio(audio_dev);
       }
     }
 
     const cz::PreviewFrame* gp = ctrl.gallery_preview();
     const uint64_t gal_seq = gp ? gp->seq : 0;
-    if (gal_seq != last_gal_seq || st.video_player.position_sec != last_vp_pos ||
-        st.video_player.playing != last_vp_playing ||
-        st.capture_flash_active != prev_flash ||
-        st.timelapse_dimmed != prev_dimmed ||
-        st.timelapse.shots_taken != prev_tl_shots ||
-        st.timelapse.next_shot_in_sec != prev_tl_next ||
-        st.timelapse.elapsed_sec != prev_tl_elapsed ||
-        st.video_elapsed_sec != prev_vid_sec ||
-        st.timer_remaining_sec != prev_timer_sec ||
-        st.timelapse.compile_current != prev_comp_cur ||
-        st.toast_message != prev_toast || st.modal != prev_modal) {
+    if (dirty_tracker.changed(st, gal_seq)) {
       dirty = true;
     }
 
     if (dirty) {
-      last_gal_seq = gal_seq;
-      last_vp_pos = st.video_player.position_sec;
-      last_vp_playing = st.video_player.playing;
-      prev_flash = st.capture_flash_active;
-      prev_dimmed = st.timelapse_dimmed;
-      prev_tl_shots = st.timelapse.shots_taken;
-      prev_tl_next = st.timelapse.next_shot_in_sec;
-      prev_tl_elapsed = st.timelapse.elapsed_sec;
-      prev_vid_sec = st.video_elapsed_sec;
-      prev_timer_sec = st.timer_remaining_sec;
-      prev_comp_cur = st.timelapse.compile_current;
-      prev_toast = st.toast_message;
-      prev_modal = st.modal;
-
-      view.render(st, &live_frame, gp);
+      dirty_tracker.sync(st, gal_seq);
+      view.render(st, effective_live_frame(st, live_frame), gp);
       present();
     }
   }

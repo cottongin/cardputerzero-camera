@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import shlex
 import struct
 import threading
 import time
@@ -141,6 +140,26 @@ def _is_16_9_mode(mode: str, main_w: int, main_h: int) -> bool:
     if main_h > 0 and abs((main_w / main_h) - (16.0 / 9.0)) < 0.05:
         return True
     return False
+
+
+class _FfmpegOutputTarget(str):
+    """str subclass for picamera2.outputs.FfmpegOutput preserving path tokens.
+
+    Upstream FfmpegOutput.start() parses output_filename with plain str.split()
+    and no shell, so paths containing spaces or shlex quotes would break.
+    """
+
+    _tokens: tuple[str, ...]
+
+    def __new__(cls, *tokens: str) -> "_FfmpegOutputTarget":
+        obj = super().__new__(cls, " ".join(tokens))
+        obj._tokens = tuple(tokens)
+        return obj
+
+    def split(self, sep: Optional[str] = None, maxsplit: int = -1) -> list[str]:
+        if sep is None and maxsplit == -1:
+            return list(self._tokens)
+        return super().split(sep, maxsplit)
 
 
 def _probe_alsa_available() -> bool:
@@ -652,7 +671,7 @@ class Picam2Worker:
 
         self._ensure_picamera2_imports()
         # Ruling 3: staging files end in .mp4.part so ffmpeg needs -f mp4 explicitly.
-        output_target = f"-f mp4 -movflags +faststart {shlex.quote(tmp_path)}"
+        output_target = _FfmpegOutputTarget("-f", "mp4", "-movflags", "+faststart", tmp_path)
 
         audio_recorded = False
         if audio:

@@ -58,7 +58,7 @@ std::string current_timestamp_compact() {
   const std::time_t now = std::time(nullptr);
   struct tm tm_now {};
   ::localtime_r(&now, &tm_now);
-  char buf[32];
+  char buf[64];
   std::snprintf(buf, sizeof(buf), "%04d%02d%02d_%02d%02d%02d",
                 tm_now.tm_year + 1900, tm_now.tm_mon + 1, tm_now.tm_mday,
                 tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec);

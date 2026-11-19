@@ -217,6 +217,7 @@ class UiController {
   bool quit_ = false;
   bool capture_flash_pending_ = false;
 
+  uint64_t last_now_ms_ = 0;
   uint64_t last_activity_ms_ = 0;
   uint64_t timer_target_ms_ = 0;
   uint64_t flash_until_ms_ = 0;

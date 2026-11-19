@@ -50,7 +50,7 @@ std::string current_iso8601_utc() {
   const std::time_t now = std::time(nullptr);
   struct tm tm_utc {};
   ::gmtime_r(&now, &tm_utc);
-  char buf[32];
+  char buf[64];
   std::snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02dZ",
                 tm_utc.tm_year + 1900, tm_utc.tm_mon + 1, tm_utc.tm_mday,
                 tm_utc.tm_hour, tm_utc.tm_min, tm_utc.tm_sec);

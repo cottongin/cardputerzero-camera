@@ -95,6 +95,7 @@ class FakePicamera2:
         self.pre_callback = None
         self.recording = False
         self.recording_attempts = []
+        self.recording_argv_history = []
         self.captured_files = []
         self.direct_captures = []
         self.switched_captures = []
@@ -170,8 +171,11 @@ class FakePicamera2:
         self.encoder = encoder
         self.output = output
         self.recording = True
-        # Extract real path from output_filename string (after -f mp4 -movflags +faststart )
-        path = output.output_filename.split()[-1].strip("'\"")
+        # Match upstream picamera2 FfmpegOutput.start(), which splits
+        # output_filename via plain str.split() without stripping shell quotes.
+        tokens = output.output_filename.split()
+        self.recording_argv_history.append(list(tokens))
+        path = tokens[-1]
         with open(path, "wb") as f:
             f.write(b"\x00\x00\x00\x18ftypmp42MOCKMP4")
 
@@ -590,6 +594,53 @@ class Picam2WorkerTest(unittest.TestCase):
         self.assertEqual(payload[:y_len], b"\x64" * y_len)
         self.assertEqual(payload[y_len : y_len + uv_len], b"\x80" * uv_len)
         self.assertEqual(payload[y_len + uv_len :], b"\x81" * uv_len)
+
+    def test_start_video_preserves_spaces_and_special_chars_in_path(self):
+        worker, _, _ = self._make_worker()
+        worker.start()
+        worker.configure(
+            mode="video",
+            main_w=1280,
+            main_h=720,
+            preview_w=226,
+            preview_h=128,
+            fps=30,
+            zoom=1.0,
+            ev=0.0,
+            transform="0",
+        )
+        picam = FakePicamera2.instances[-1]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spaced_dir = os.path.join(tmpdir, "My Drive (1);test's")
+            os.makedirs(spaced_dir, exist_ok=True)
+            video_path = os.path.join(spaced_dir, ".VID_20261119_124000.mp4.part")
+
+            res = worker.start_video(
+                tmp_path=video_path,
+                width=1280,
+                height=720,
+                fps=30,
+                bitrate=4000000,
+                audio=False,
+            )
+            self.assertFalse(res["audio_recorded"])
+            self.assertTrue(picam.recording)
+            self.assertTrue(os.path.isfile(video_path))
+            self.assertEqual(
+                picam.recording_argv_history[-1],
+                ["-f", "mp4", "-movflags", "+faststart", video_path],
+            )
+            self.assertIsInstance(picam.output.output_filename, str)
+            self.assertIn("-f mp4", picam.output.output_filename)
+            self.assertIn("-movflags +faststart", picam.output.output_filename)
+            self.assertIn(video_path, picam.output.output_filename)
+            self.assertEqual(
+                str(picam.output.output_filename),
+                f"-f mp4 -movflags +faststart {video_path}",
+            )
+            stop_res = worker.stop_video()
+            self.assertGreater(stop_res["bytes"], 0)
 
 
 if __name__ == "__main__":

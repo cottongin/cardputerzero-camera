@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import select
@@ -8,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 from czcamera_cam.protocol import (
     CZFR_HEADER_STRUCT,
@@ -16,6 +18,7 @@ from czcamera_cam.protocol import (
     PIXFMT_RGB24,
     PIXFMT_YUV420,
     FramePipeWriter,
+    JsonProtocolServer,
     pack_czfr_header,
 )
 
@@ -393,6 +396,120 @@ class ProtocolTest(unittest.TestCase):
                 proc.stdout.close()
             if proc.stderr:
                 proc.stderr.close()
+
+    def test_frame_pipe_writer_validates_header_in_push_frame(self):
+        r_fd, w_fd = os.pipe()
+        thread_errors = []
+        orig_hook = threading.excepthook
+        threading.excepthook = lambda args: thread_errors.append(args)
+        writer = FramePipeWriter(w_fd, owns_fd=False)
+        writer.start()
+        try:
+            with self.assertRaises(ValueError):
+                writer.push_frame(226, 170, 99, 0, b"\x00")
+            with self.assertRaises(ValueError):
+                writer.push_frame(70000, 170, PIXFMT_YUV420, 0, b"\x00")
+            self.assertEqual(thread_errors, [])
+        finally:
+            writer.stop()
+            threading.excepthook = orig_hook
+            os.close(r_fd)
+            os.close(w_fd)
+
+    def test_frame_pipe_writer_select_errors_and_safe_close(self):
+        # 1. InterruptedError retries select, then OSError / ValueError exit cleanly without thread crash
+        for terminal_exc in (OSError("EBADF"), ValueError("fd out of range")):
+            r_fd, w_fd = os.pipe()
+            thread_errors = []
+            orig_hook = threading.excepthook
+            threading.excepthook = lambda args: thread_errors.append(args)
+            writer = FramePipeWriter(w_fd, owns_fd=False)
+            select_calls = []
+
+            def fake_select(_r, wlist, _x, _timeout):
+                select_calls.append(len(select_calls))
+                if len(select_calls) == 1:
+                    raise InterruptedError("EINTR")
+                raise terminal_exc
+
+            try:
+                with mock.patch("czcamera_cam.protocol.os.write", side_effect=BlockingIOError), \
+                     mock.patch("czcamera_cam.protocol.select.select", side_effect=fake_select):
+                    writer.start()
+                    writer.push_frame(4, 4, PIXFMT_YUV420, 0, b"\x00" * 24)
+                    deadline = time.monotonic() + 2.0
+                    while len(select_calls) < 2 and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    time.sleep(0.05)
+                self.assertEqual(len(select_calls), 2)
+                self.assertEqual(thread_errors, [])
+            finally:
+                writer.stop()
+                threading.excepthook = orig_hook
+                os.close(r_fd)
+                os.close(w_fd)
+
+        # 2. owns_fd=True must NOT close fd while writer thread is still alive on stop() timeout
+        r_fd, w_fd = os.pipe()
+        writer = FramePipeWriter(w_fd, owns_fd=True)
+        write_started = threading.Event()
+        release_write = threading.Event()
+        closed_fds = []
+        real_close = os.close
+
+        def slow_write(_fd, buf):
+            write_started.set()
+            release_write.wait(timeout=2.0)
+            return len(buf)
+
+        def tracked_close(fd):
+            closed_fds.append(fd)
+            return real_close(fd)
+
+        try:
+            with mock.patch("czcamera_cam.protocol.os.write", side_effect=slow_write), \
+                 mock.patch("czcamera_cam.protocol.os.close", side_effect=tracked_close):
+                writer.start()
+                writer.push_frame(4, 4, PIXFMT_YUV420, 0, b"\x00" * 24)
+                self.assertTrue(write_started.wait(timeout=2.0))
+
+                # Timeout expires while slow_write is still blocked; fd must NOT be closed yet.
+                writer.stop(timeout=0.02)
+                self.assertNotIn(w_fd, closed_fds)
+
+                # Unblock writer thread; thread finishes and closes w_fd exactly once.
+                release_write.set()
+                deadline = time.monotonic() + 2.0
+                while w_fd not in closed_fds and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertEqual(closed_fds.count(w_fd), 1)
+                writer.stop(timeout=0.1)
+                self.assertEqual(closed_fds.count(w_fd), 1)
+        finally:
+            release_write.set()
+            real_close(r_fd)
+            if w_fd not in closed_fds:
+                real_close(w_fd)
+
+    def test_json_protocol_server_calls_shutdown_if_worker_start_raises(self):
+        events = []
+
+        class FailingStartWorker:
+            def start(self):
+                events.append("start")
+                raise RuntimeError("camera open failed")
+
+            def shutdown(self):
+                events.append("shutdown")
+
+        server = JsonProtocolServer(
+            worker_factory=lambda _emit: FailingStartWorker(),
+            stdin=io.StringIO(""),
+            stdout=io.StringIO(""),
+        )
+        with self.assertRaisesRegex(RuntimeError, "camera open failed"):
+            server.run()
+        self.assertEqual(events, ["start", "shutdown"])
 
 
 if __name__ == "__main__":
