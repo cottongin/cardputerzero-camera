@@ -1,5 +1,5 @@
 > [!IMPORTANT]  
-> This project was developed with AI coding assistance and has not yet undergone a full hardware soak test on physical CM0 hardware. It is provided under the Apache 2.0 license and may require adjustment for other environments.
+> This project was developed entirely with AI coding assistance (Google Neon) and has not undergone rigorous review. It is provided as-is and may require adjustments for other environments.
 
 # Architecture & Camera Protocol Reference
 
@@ -126,3 +126,5 @@ Exact palette tokens defined in [`app/src/theme.cpp`](../app/src/theme.cpp):
 - **`app/tests/`**: `test_config_and_storage.cpp`, `test_filters_and_jpeg.cpp`, `test_backend_protocol.cpp`, `test_timelapse_and_gallery.cpp`, `test_ui_controller.cpp`
 - **`cam-helper/`**: `bin/czcamera-cam`, `czcamera_cam/{__init__,protocol,picam2_worker}.py`, `tests/test_{protocol,picam2_worker}.py`
 - **`packaging/`**: `Dockerfile.arm64`, `build-deb.sh`, `czcamera.desktop`, `czcamera.png`, `debian/{control,postinst,prerm}`, `tests/test_packaging.py`
+- **`docs/`**: User/developer guides (`building-and-installation.md`, `usage-and-controls.md`, `architecture-and-protocol.md`)
+- **`LICENSE.md`**: Apache License, Version 2.0

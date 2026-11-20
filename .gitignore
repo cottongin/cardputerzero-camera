@@ -1,4 +1,6 @@
 .superpowers/
+chat-summaries/
+docs/superpowers/
 app/build/
 app/build-arm64/
 packaging/dist/

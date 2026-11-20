@@ -1,5 +1,5 @@
 > [!IMPORTANT]  
-> This project was developed with AI coding assistance and has not yet undergone a full hardware soak test on physical CM0 hardware. It is provided under the Apache 2.0 license and may require adjustment for other environments.
+> This project was developed entirely with AI coding assistance (Google Neon) and has not undergone rigorous review. It is provided as-is and may require adjustments for other environments.
 
 # Usage, Controls & Configuration Guide
 
