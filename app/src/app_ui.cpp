@@ -825,8 +825,7 @@ struct AppView::Impl {
     if (show_live_frame) {
       scaled_vf.resize(static_cast<size_t>(feed_w) * static_cast<size_t>(feed_h) *
                        3u);
-      const float loupe =
-          (state.mode == AppMode::Photo && state.loupe_enabled) ? 2.0f : 1.0f;
+      const float loupe = state.loupe_enabled ? 2.0f : 1.0f;
       scale_crop_rgb24(live_frame->rgb24.data(), live_frame->width,
                        live_frame->height, scaled_vf.data(), feed_w, feed_h,
                        loupe);
@@ -875,7 +874,7 @@ struct AppView::Impl {
 
     // Top-right Zoom / Loupe badge
     int right_edge = vf_x + kVfW - 5;
-    if (state.mode == AppMode::Photo && state.loupe_enabled) {
+    if (state.loupe_enabled) {
       const std::string ltext = "LOUPE 2x";
       const int lw = measure_pill_badge_w(canvas, ltext, false);
       draw_pill_badge(canvas, right_edge - lw, badge_y, 16, ltext,
@@ -1009,7 +1008,9 @@ struct AppView::Impl {
               false};
           cards[1] = {
               "OUT",
-              state.config.timelapse_output_mode == "photos" ? "JPG" : "MP4",
+              state.config.timelapse_output_mode == "photos"
+                  ? "JPG"
+                  : ("MP4 " + std::to_string(state.config.timelapse_fps)),
               0,
               false};
           cards[2] = {"RES",
@@ -1059,24 +1060,27 @@ struct AppView::Impl {
       draw_kbd_hint(canvas, pal, hx2, 156, "S", "Set", 8, 2);
     } else if (state.mode == AppMode::Video) {
       if (state.video_recording) {
-        draw_kbd_hint(canvas, pal, hx1, 143, "Esc", "Stop Rec", 8, 2);
-        draw_kbd_hint(canvas, pal, hx2, 156, "5/7", "Zoom", 8, 2);
-      } else {
-        draw_kbd_hint(canvas, pal, hx1, 143, "Ent", "Rec", 8, 4);
-        draw_kbd_hint(canvas, pal, hx1, 143, "M", "Mic", 8, 2);
+        draw_kbd_hint(canvas, pal, hx1, 143, "Esc", "Stop", 8, 2);
+        draw_kbd_hint(canvas, pal, hx1, 143, "Z", "Lpe", 8, 2);
         draw_kbd_hint(canvas, pal, hx2, 156, "5/7", "Zm", 8, 3);
-        draw_kbd_hint(canvas, pal, hx2, 156, "S", "Set", 8, 2);
+        draw_kbd_hint(canvas, pal, hx2, 156, "G", "Grd", 8, 2);
+      } else {
+        draw_kbd_hint(canvas, pal, hx1, 143, "Ent", "Rec", 8, 3);
+        draw_kbd_hint(canvas, pal, hx1, 143, "M", "Mic", 8, 2);
+        draw_kbd_hint(canvas, pal, hx2, 156, "5/7", "Zm", 8, 2);
+        draw_kbd_hint(canvas, pal, hx2, 156, "Z", "Lpe", 8, 2);
       }
     } else {
       if (state.timelapse.running) {
         draw_kbd_hint(canvas, pal, hx1, 143, "Esc", "Stop", 8, 2);
-        canvas.draw_text(FontRole::Sans, 8, inner_x, 157, "Capturing...",
-                         pal.status_online);
+        draw_kbd_hint(canvas, pal, hx1, 143, "Z", "Lpe", 8, 2);
+        draw_kbd_hint(canvas, pal, hx2, 156, "5/7", "Zm", 8, 3);
+        draw_kbd_hint(canvas, pal, hx2, 156, "G", "Grd", 8, 2);
       } else {
         draw_kbd_hint(canvas, pal, hx1, 143, "Ent", "Go", 8, 4);
         draw_kbd_hint(canvas, pal, hx1, 143, "C", "Cust", 8, 2);
-        draw_kbd_hint(canvas, pal, hx2, 156, "8", "Gal", 8, 4);
-        draw_kbd_hint(canvas, pal, hx2, 156, "S", "Set", 8, 2);
+        draw_kbd_hint(canvas, pal, hx2, 156, "5/7", "Zm", 8, 2);
+        draw_kbd_hint(canvas, pal, hx2, 156, "Z", "Lpe", 8, 2);
       }
     }
   }
@@ -1408,7 +1412,8 @@ struct AppView::Impl {
       const std::array<std::pair<std::string, std::string>, 4> rows = {{
           {"Interval (s)",
            std::to_string(state.tl_custom_interval_sec) + "s"},
-          {"Video FPS", std::to_string(state.tl_custom_fps) + " fps"},
+          {"Video FPS (1-30)",
+           std::to_string(state.tl_custom_fps) + " fps"},
           {"Stop Mode", state.tl_custom_stop_mode},
           {"Stop Value", stop_val_str},
       }};

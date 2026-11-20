@@ -269,17 +269,26 @@ void test_photo_controls_zoom_loupe_filters_and_timer() {
   ctrl.handle_key('5', cz::KeyCode::Char, now);
   assert(ctrl.state().zoom == 1.0f);
 
-  // Loupe L toggles 2x viewfinder magnification without changing sensor zoom
+  // Loupe Z toggles 2x viewfinder magnification without changing sensor zoom;
+  // lowercase 'l' acts as Right (adjust_rail_setting(+1)) for hjkl navigation.
   ctrl.handle_key('7', cz::KeyCode::Char, now);
   assert(ctrl.state().zoom == 1.5f);
   const int calls_before_loupe = spy->set_controls_calls;
-  ctrl.handle_key('l', cz::KeyCode::Char, now);
+  ctrl.handle_key('z', cz::KeyCode::Char, now);
   assert(ctrl.state().loupe_enabled);
   assert(ctrl.state().zoom == 1.5f);
   assert(spy->last_zoom == 1.5f);
   assert(spy->set_controls_calls == calls_before_loupe);
-  ctrl.handle_key('L', cz::KeyCode::Char, now);
+  ctrl.handle_key('Z', cz::KeyCode::Char, now);
   assert(!ctrl.state().loupe_enabled);
+
+  assert(ctrl.state().rail_cursor == 1);
+  assert(ctrl.state().config.ev == 0.0);
+  ctrl.handle_key('l', cz::KeyCode::Char, now);
+  assert(!ctrl.state().loupe_enabled);
+  assert(ctrl.state().config.ev == 0.5);
+  ctrl.handle_key('h', cz::KeyCode::Char, now);
+  assert(ctrl.state().config.ev == 0.0);
 
   // F cycles through all 9 filters and wraps back to None
   const cz::FilterId expected_filters[9] = {
@@ -461,6 +470,25 @@ void test_video_mode_locks_transitions_while_recording() {
   assert(ctrl.state().config.ev == ev_before);
   assert(cz::load_config(cfg_path).ev == ev_before);
 
+  // Idle Z toggles Loupe in Video mode too and renders distinctly
+  assert(!ctrl.state().loupe_enabled);
+  cz::PreviewFrame vid_live;
+  assert(ctrl.backend()->copy_latest_preview(0, vid_live));
+  cz::AppView vid_view;
+  vid_view.render(ctrl.state(), &vid_live, nullptr);
+  std::vector<uint32_t> vid_no_loupe(
+      vid_view.pixels(),
+      vid_view.pixels() + cz::AppView::kWidth * cz::AppView::kHeight);
+  ctrl.handle_key('z', cz::KeyCode::Char, now);
+  assert(ctrl.state().loupe_enabled);
+  vid_view.render(ctrl.state(), &vid_live, nullptr);
+  std::vector<uint32_t> vid_with_loupe(
+      vid_view.pixels(),
+      vid_view.pixels() + cz::AppView::kWidth * cz::AppView::kHeight);
+  assert(vid_no_loupe != vid_with_loupe);
+  ctrl.handle_key('Z', cz::KeyCode::Char, now);
+  assert(!ctrl.state().loupe_enabled);
+
   // Start recording with Enter
   ctrl.handle_key(0, cz::KeyCode::Enter, now);
   assert(ctrl.state().video_recording);
@@ -479,9 +507,13 @@ void test_video_mode_locks_transitions_while_recording() {
     assert(!ctrl.should_quit());
   }
 
-  // Zoom 5/7 still works live during recording
+  // Zoom 5/7 and Loupe Z still work live during recording
   ctrl.handle_key('7', cz::KeyCode::Char, now);
   assert(ctrl.state().zoom == 1.5f);
+  ctrl.handle_key('z', cz::KeyCode::Char, now);
+  assert(ctrl.state().loupe_enabled);
+  ctrl.handle_key('z', cz::KeyCode::Char, now);
+  assert(!ctrl.state().loupe_enabled);
 
   now += 1500;
   ctrl.tick(now);
@@ -818,19 +850,80 @@ void test_text_input_timelapse_custom_recovery_and_modal_renders() {
   assert(ctrl.state().modal == cz::OverlayModal::TimelapseCustomInput);
   ctrl.handle_key('1', cz::KeyCode::Char, now);
   ctrl.handle_key('2', cz::KeyCode::Char, now);
-  assert(ctrl.state().tl_custom_interval_sec == 12);
-  ctrl.handle_key(0, cz::KeyCode::Down, now);
-  ctrl.handle_key(0, cz::KeyCode::Right, now);  // 24 -> 30 fps
-  assert(ctrl.state().tl_custom_fps == 30);
-  ctrl.handle_key(0, cz::KeyCode::Down, now);
-  ctrl.handle_key(0, cz::KeyCode::Right, now);  // manual -> shots
-  assert(ctrl.state().tl_custom_stop_mode == "shots");
-  view.render(ctrl.state(), &live, nullptr);
-  ctrl.handle_key(0, cz::KeyCode::Enter, now);
-  assert(ctrl.state().modal == cz::OverlayModal::None);
-  assert(ctrl.state().config.timelapse_interval_sec == 12);
-  assert(ctrl.state().config.timelapse_fps == 30);
-  assert(ctrl.state().config.timelapse_stop_mode == "shots");
+    assert(ctrl.state().tl_custom_interval_sec == 12);
+    ctrl.handle_key(0, cz::KeyCode::Down, now);
+    // Custom FPS supports +/-1 stepping AND direct 1..30 numeric typing
+    assert(ctrl.state().tl_custom_fps == 24);
+    ctrl.handle_key(0, cz::KeyCode::Right, now);
+    assert(ctrl.state().tl_custom_fps == 25);
+    ctrl.handle_key('h', cz::KeyCode::Char, now);
+    assert(ctrl.state().tl_custom_fps == 24);
+    ctrl.handle_key('1', cz::KeyCode::Char, now);
+    ctrl.handle_key('2', cz::KeyCode::Char, now);
+    assert(ctrl.state().tl_custom_fps == 12);
+    ctrl.handle_key(0, cz::KeyCode::Backspace, now);
+    assert(ctrl.state().tl_custom_fps == 1);
+    ctrl.handle_key(0, cz::KeyCode::Backspace, now);
+    ctrl.handle_key('3', cz::KeyCode::Char, now);
+    ctrl.handle_key('5', cz::KeyCode::Char, now);
+    assert(ctrl.state().tl_custom_fps == 30);
+    ctrl.handle_key(0, cz::KeyCode::Backspace, now);
+    ctrl.handle_key(0, cz::KeyCode::Backspace, now);
+    ctrl.handle_key('7', cz::KeyCode::Char, now);
+    assert(ctrl.state().tl_custom_fps == 7);
+    ctrl.handle_key(0, cz::KeyCode::Down, now);
+    ctrl.handle_key(0, cz::KeyCode::Right, now);  // manual -> shots
+    assert(ctrl.state().tl_custom_stop_mode == "shots");
+    view.render(ctrl.state(), &live, nullptr);
+    ctrl.handle_key(0, cz::KeyCode::Enter, now);
+    assert(ctrl.state().modal == cz::OverlayModal::None);
+    assert(ctrl.state().config.timelapse_interval_sec == 12);
+    assert(ctrl.state().config.timelapse_fps == 7);
+    assert(cz::load_config(cfg_path).timelapse_fps == 7);
+    assert(ctrl.state().config.timelapse_stop_mode == "shots");
+
+    // Timelapse idle & active zoom (5/7) and Loupe (Z) work cleanly
+    assert(ctrl.state().zoom == 1.0f);
+    assert(!ctrl.state().loupe_enabled);
+    ctrl.handle_key('7', cz::KeyCode::Char, now);
+    assert(ctrl.state().zoom == 1.5f);
+    ctrl.handle_key('z', cz::KeyCode::Char, now);
+    assert(ctrl.state().loupe_enabled);
+    view.render(ctrl.state(), &live, nullptr);
+    std::vector<uint32_t> tl_with_loupe(
+        view.pixels(), view.pixels() + cz::AppView::kWidth * cz::AppView::kHeight);
+    ctrl.handle_key('z', cz::KeyCode::Char, now);
+    assert(!ctrl.state().loupe_enabled);
+    view.render(ctrl.state(), &live, nullptr);
+    std::vector<uint32_t> tl_no_loupe(
+        view.pixels(), view.pixels() + cz::AppView::kWidth * cz::AppView::kHeight);
+    assert(tl_with_loupe != tl_no_loupe);
+
+    // Also verify zoom & Loupe stay responsive while Timelapse is actively running
+    ctrl.handle_key(0, cz::KeyCode::Enter, now);
+    ctrl.tick(now);
+    assert(ctrl.state().timelapse.running);
+    ctrl.handle_key('7', cz::KeyCode::Char, now);
+    assert(ctrl.state().zoom == 2.0f);
+    ctrl.handle_key('5', cz::KeyCode::Char, now);
+    assert(ctrl.state().zoom == 1.5f);
+    ctrl.handle_key('z', cz::KeyCode::Char, now);
+    assert(ctrl.state().loupe_enabled);
+    ctrl.handle_key('z', cz::KeyCode::Char, now);
+    assert(!ctrl.state().loupe_enabled);
+    ctrl.handle_key(0, cz::KeyCode::Esc, now);
+    assert(ctrl.state().modal == cz::OverlayModal::TimelapseStopConfirm);
+    ctrl.handle_key('y', cz::KeyCode::Char, now);
+    {
+      const auto dl =
+          std::chrono::steady_clock::now() + std::chrono::seconds(8);
+      while (ctrl.state().modal == cz::OverlayModal::TimelapseCompiling &&
+             std::chrono::steady_clock::now() < dl) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        now += 20;
+        ctrl.tick(now);
+      }
+    }
 
   // Settings -> DirPicker -> [T] TextInput manual directory entry
   ctrl.handle_key('s', cz::KeyCode::Char, now);

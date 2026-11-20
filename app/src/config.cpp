@@ -56,10 +56,7 @@ AppConfig sanitize_config(AppConfig cfg) {
   if (!is_one_of(cfg.timelapse_output_mode, {"video", "photos"})) {
     cfg.timelapse_output_mode = "video";
   }
-  if (cfg.timelapse_fps != 15 && cfg.timelapse_fps != 24 &&
-      cfg.timelapse_fps != 30) {
-    cfg.timelapse_fps = 24;
-  }
+  cfg.timelapse_fps = std::clamp(cfg.timelapse_fps, 1, 30);
   if (!is_one_of(cfg.timelapse_stop_mode, {"manual", "shots", "duration"})) {
     cfg.timelapse_stop_mode = "manual";
   }

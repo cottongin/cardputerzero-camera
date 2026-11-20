@@ -12,9 +12,9 @@ Includes a desktop **SDL2 simulator** (`--sim`) with a procedural test scene (`-
 ## Key Features
 
 - **Option A Split Layout (`320×170`):** Live `226×170` viewfinder alongside a focusable `94×170` control rail (`1P · 2V · 3T`), with live **`[W]`** rail-side toggle (`right` default or `left`) and **`[T]`** Zinc Dark / Light theme toggle.
-- **Photo Mode + 9 Filters:** True ISP `ScalerCrop` zoom (`1x`–`4x` via `5`/`7`), independent `2x` viewfinder-only **Loupe** (`L`), EV (`-2.0` to `+2.0`), `8MP` / `2MP` presets (`R`), `Off`/`3s`/`10s` self-timer (`C`), `[G]` rule-of-thirds grid, and 9 shared RGB24/`libjpeg` filters (`None` zero-re-encode passthrough, `B&W`, `Hi-Con`, `Sepia`, `Cool`, `Vivid`, `Invert`, `Retro`, and Bayer-dithered `GameBoy` DMG).
-- **Hardware H.264 Video Mode:** `720p30` (default), `1080p30`, and `480p30` `.mp4` recording with ES8389 MEMS mic ON by default (`[M]` idle mute toggle, graceful muted fallback on `audio_unavailable`), live 16:9 letterboxed viewfinder, and live digital zoom during capture.
-- **Foreground Timelapse Mode:** `2MP` default (`1080p` / `8MP` presets), customizable interval/FPS/stop presets (`C` / `P`), output to `TL_<timestamp>/` JPEGs or compiled `TL_<timestamp>.mp4` (`h264_v4l2m2m` with automatic `libx264` fallback and `8MP`→`1440×1080` scaling for VideoCore IV's `2048px` encoder ceiling), sysfs backlight auto-dim + **dimmed safe-wake** (any keypress only wakes the display), and startup recovery for orphaned `.tl_work_*` sessions.
+- **Photo Mode + 9 Filters:** True ISP `ScalerCrop` zoom (`1x`–`4x` via `5`/`7`), independent `2x` viewfinder-only **Loupe** (`Z`), EV (`-2.0` to `+2.0`), `8MP` / `2MP` presets (`R`), `Off`/`3s`/`10s` self-timer (`C`), `[G]` rule-of-thirds grid, and 9 shared RGB24/`libjpeg` filters (`None` zero-re-encode passthrough, `B&W`, `Hi-Con`, `Sepia`, `Cool`, `Vivid`, `Invert`, `Retro`, and Bayer-dithered `GameBoy` DMG).
+- **Hardware H.264 Video Mode:** `720p30` (default), `1080p30`, and `480p30` `.mp4` recording with ES8389 MEMS mic ON by default (`[M]` idle mute toggle, graceful muted fallback on `audio_unavailable`), live 16:9 letterboxed viewfinder, and live digital zoom (`5`/`7`) and `2x` Loupe (`Z`) during capture.
+- **Foreground Timelapse Mode:** `2MP` default (`1080p` / `8MP` presets), customizable interval, any FPS `1..30`, and stop presets (`C` / `P`), live zoom (`5`/`7`) & `2x` Loupe (`Z`), output to `TL_<timestamp>/` JPEGs or compiled `TL_<timestamp>.mp4` (`h264_v4l2m2m` at memory-safe `1024×768` / `1280×720` with low-RAM `libx264` fallback), sysfs backlight auto-dim + **dimmed safe-wake** (any keypress only wakes the display), and startup recovery for orphaned `.tl_work_*` sessions.
 - **Full-Screen Gallery & Video Playback (`[8]`):** Pauses the camera backend while open, supports `TL_*` session drill-down, plays `.mp4` videos (with or without audio tracks) via `ffmpeg`/`aplay` (or SDL2 audio on desktop) with `-5s`/`+5s` seek, and enforces `[Y/N]` delete confirmation.
 - **Settings & Directory Tree Picker (`[S]`):** Output folder browser (plus `[T]` manual path entry), `Camera Orient` (`auto`, `0°`, `180°`, `H-Flip`, `V-Flip` via ISP `Transform`), rail side, theme, grid, and auto-dim timeout.
 - **Sync-Safe & Hardware-Decoupled:** Writes exclusively to `.`-prefixed staging paths until finalized via `fsync` + atomic `rename()` (with a `100 MB` free-space guard), keeping zero runtime/packaging dependencies on external sync tools or direct `libcamera.so` linkage.
@@ -76,9 +76,9 @@ python3 -m unittest discover -s packaging/tests -v
 | `1`, `2`, `3` | Main View | Switch between **Photo**, **Video**, and **Timelapse** |
 | `Enter`, `Space`, `6` | Main View | Trigger shutter / Start-Stop recording / Open Timelapse stop prompt |
 | `Up`/`Down` or `k`/`j` | Rail / Lists / Modals | Move selection cursor |
-| `Left`/`Right` or `h`/`l` | Rail / Settings | Cycle selected card value (`l` toggles `2x` Loupe in idle Photo view) |
-| `5` / `7` | Photo / Video | Step ISP digital crop zoom (`1.0x`–`4.0x`) |
-| `L` | Photo | Toggle `2x` viewfinder-only Loupe |
+| `Left`/`Right` or `h`/`l` | Rail / Settings | Cycle selected card value |
+| `5` / `7` | Photo / Video / Timelapse | Step ISP digital crop zoom (`1.0x`–`4.0x`, live during Video & Timelapse) |
+| `Z` | Photo / Video / Timelapse | Toggle `2x` viewfinder-only Loupe (works idle or recording/capturing) |
 | `F` | Photo | Cycle 9 photo filters (`None` .. `GameBoy`) |
 | `R` | Photo / Video / TL (or Offline) | Cycle resolution preset (or recover camera when `Offline`) |
 | `C` | Photo / Timelapse | Cycle self-timer (`Off`/`3s`/`10s`) in Photo; open Custom TL modal in Timelapse |

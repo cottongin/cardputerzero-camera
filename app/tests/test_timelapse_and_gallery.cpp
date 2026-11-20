@@ -310,23 +310,31 @@ void test_timelapse_compile_8mp_scaling_and_h264_fallback() {
 
   const auto cmd_8mp_hw =
       cz::TimelapseEngine::build_compile_command(paths, 24, "8mp", true);
-  assert(has_arg_pair(cmd_8mp_hw, "-vf", "scale=1440:1080:flags=lanczos"));
+  assert(has_arg_pair(cmd_8mp_hw, "-threads", "1"));
+  assert(has_arg_pair(cmd_8mp_hw, "-filter_threads", "1"));
+  assert(has_arg_pair(cmd_8mp_hw, "-vf", "scale=1024:768:flags=bilinear,setsar=1"));
   assert(has_arg_pair(cmd_8mp_hw, "-c:v", "h264_v4l2m2m"));
+  assert(has_arg_pair(cmd_8mp_hw, "-num_output_buffers", "4"));
+  assert(has_arg_pair(cmd_8mp_hw, "-b:v", "5M"));
   assert(has_arg_pair(cmd_8mp_hw, "-f", "mp4"));
   assert(has_arg_pair(cmd_8mp_hw, "-movflags", "+faststart"));
   assert(has_arg(cmd_8mp_hw, paths.mp4_tmp_path));
 
   const auto cmd_2mp_sw =
-      cz::TimelapseEngine::build_compile_command(paths, 24, "2mp", false);
-  assert(!has_arg(cmd_2mp_sw, "-vf"));
+      cz::TimelapseEngine::build_compile_command(paths, 12, "2mp", false);
+  assert(has_arg_pair(cmd_2mp_sw, "-framerate", "12"));
+  assert(has_arg_pair(cmd_2mp_sw, "-vf", "scale=1024:768:flags=bilinear,setsar=1"));
   assert(has_arg_pair(cmd_2mp_sw, "-c:v", "libx264"));
-  assert(has_arg_pair(cmd_2mp_sw, "-preset", "veryfast"));
-  assert(has_arg_pair(cmd_2mp_sw, "-crf", "22"));
+  assert(has_arg_pair(cmd_2mp_sw, "-threads", "2"));
+  assert(has_arg_pair(cmd_2mp_sw, "-preset", "ultrafast"));
+  assert(has_arg_pair(cmd_2mp_sw, "-crf", "23"));
+  assert(has_arg_pair(cmd_2mp_sw, "-x264-params",
+                      "rc-lookahead=0:ref=1:bframes=0:threads=2:lookahead-threads=1:sync-lookahead=0"));
   assert(has_arg_pair(cmd_2mp_sw, "-f", "mp4"));
 
   const auto cmd_1080_hw =
       cz::TimelapseEngine::build_compile_command(paths, 30, "1080p", true);
-  assert(!has_arg(cmd_1080_hw, "-vf"));
+  assert(has_arg_pair(cmd_1080_hw, "-vf", "scale=1280:720:flags=bilinear,setsar=1"));
   assert(has_arg_pair(cmd_1080_hw, "-framerate", "30"));
 
   // Generate 3 real JPEGs and compile with 8mp scaling (triggers h264_v4l2m2m -> libx264 fallback on macOS)
@@ -366,15 +374,15 @@ void test_timelapse_compile_8mp_scaling_and_h264_fallback() {
   assert(!engine.state().compiling);
   assert(engine.state().last_error.empty());
 
-  // Probe compiled MP4 via GalleryStore to verify 1440x1080 scaled output
+  // Probe compiled MP4 via GalleryStore to verify CM0-safe 1024x768 scaled output
   cz::GalleryStore gallery;
   assert(gallery.refresh(out_dir));
   assert(gallery.items().size() == 1);
   cz::GalleryItem item = gallery.items()[0];
   assert(item.type == cz::GalleryItemType::Video);
   assert(gallery.probe_video_meta(item));
-  assert(item.width == 1440);
-  assert(item.height == 1080);
+  assert(item.width == 1024);
+  assert(item.height == 768);
 
   // Also test video-mode live capture + request_stop() + cancel_compile() preserving staging files
   cz::SimCameraBackend sim;

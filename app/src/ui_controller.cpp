@@ -22,7 +22,6 @@ constexpr uint64_t kCaptureFlashMs = 150ULL;
 constexpr uint64_t kToastDurationMs = 3000ULL;
 constexpr std::array<float, 5> kZoomSteps = {1.0f, 1.5f, 2.0f, 3.0f, 4.0f};
 constexpr std::array<int, 6> kIntervalPresets = {2, 5, 10, 30, 60, 300};
-constexpr std::array<int, 3> kFpsPresets = {15, 24, 30};
 constexpr std::array<int, 4> kDimPresets = {15, 30, 60, 0};
 constexpr std::array<const char*, 5> kOrientPresets = {"auto", "0", "180",
                                                        "hflip", "vflip"};
@@ -1123,7 +1122,7 @@ void UiController::open_timelapse_custom_input() {
   state_.modal = OverlayModal::TimelapseCustomInput;
   state_.tl_custom_cursor = 0;
   state_.tl_custom_interval_sec = state_.config.timelapse_interval_sec;
-  state_.tl_custom_fps = state_.config.timelapse_fps;
+  state_.tl_custom_fps = std::clamp(state_.config.timelapse_fps, 1, 30);
   state_.tl_custom_stop_mode = state_.config.timelapse_stop_mode;
   state_.tl_custom_stop_value = state_.config.timelapse_stop_value;
   state_.tl_custom_text.clear();
@@ -1185,11 +1184,23 @@ bool UiController::handle_none_modal_key(char ch,
           ? static_cast<char>(std::tolower(static_cast<unsigned char>(ch)))
           : 0;
 
-  // Active Timelapse running locks all mode/settings switches
+  // Active Timelapse running locks all mode/settings switches while keeping zoom/loupe/grid active
   if (tl_running) {
     if (code == KeyCode::Enter || code == KeyCode::Esc || lower == '6' ||
         lower == 'q') {
       state_.modal = OverlayModal::TimelapseStopConfirm;
+      return true;
+    }
+    if (lower == '5') {
+      adjust_zoom(-1);
+      return true;
+    }
+    if (lower == '7') {
+      adjust_zoom(+1);
+      return true;
+    }
+    if (lower == 'z') {
+      state_.loupe_enabled = !state_.loupe_enabled;
       return true;
     }
     if (lower == 'g') {
@@ -1200,7 +1211,7 @@ bool UiController::handle_none_modal_key(char ch,
     return false;
   }
 
-  // Active Video recording locks transitions while keeping zoom and stop active
+  // Active Video recording locks transitions while keeping zoom/loupe/grid/stop active
   if (vid_recording) {
     if (code == KeyCode::Enter || code == KeyCode::Space ||
         code == KeyCode::Esc || lower == '6') {
@@ -1213,6 +1224,10 @@ bool UiController::handle_none_modal_key(char ch,
     }
     if (lower == '7') {
       adjust_zoom(+1);
+      return true;
+    }
+    if (lower == 'z') {
+      state_.loupe_enabled = !state_.loupe_enabled;
       return true;
     }
     if (lower == 'g') {
@@ -1268,11 +1283,6 @@ bool UiController::handle_none_modal_key(char ch,
     return true;
   }
   if (code == KeyCode::Right || lower == 'l') {
-    // Note: lowercase 'l' toggles Loupe in Photo mode per spec §5.4/§5.8!
-    if (lower == 'l' && state_.mode == AppMode::Photo) {
-      state_.loupe_enabled = !state_.loupe_enabled;
-      return true;
-    }
     adjust_rail_setting(+1);
     return true;
   }
@@ -1297,12 +1307,9 @@ bool UiController::handle_none_modal_key(char ch,
     case '7':
       adjust_zoom(+1);
       return true;
-    case 'l':
-      if (state_.mode == AppMode::Photo) {
-        state_.loupe_enabled = !state_.loupe_enabled;
-        return true;
-      }
-      return false;
+    case 'z':
+      state_.loupe_enabled = !state_.loupe_enabled;
+      return true;
     case 'f':
       if (state_.mode == AppMode::Photo) {
         state_.filter = next_filter(state_.filter, +1);
@@ -1765,7 +1772,7 @@ bool UiController::handle_tl_custom_key(char ch,
       (code == KeyCode::Char && (ch == '\n' || ch == '\r'))) {
     state_.config.timelapse_interval_sec =
         std::clamp(state_.tl_custom_interval_sec, 1, 3600);
-    state_.config.timelapse_fps = state_.tl_custom_fps;
+    state_.config.timelapse_fps = std::clamp(state_.tl_custom_fps, 1, 30);
     state_.config.timelapse_stop_mode = state_.tl_custom_stop_mode;
     state_.config.timelapse_stop_value =
         (state_.tl_custom_stop_mode == "manual")
@@ -1797,16 +1804,19 @@ bool UiController::handle_tl_custom_key(char ch,
     return true;
   }
 
-  // Numeric entry for Interval (row 0) or Stop Value (row 3)
+  // Numeric entry for Interval (row 0), Video FPS (row 1), or Stop Value (row 3)
   if (code == KeyCode::Char && std::isdigit(static_cast<unsigned char>(ch))) {
-    if (state_.tl_custom_cursor == 0 ||
+    if (state_.tl_custom_cursor == 0 || state_.tl_custom_cursor == 1 ||
         (state_.tl_custom_cursor == 3 &&
          state_.tl_custom_stop_mode != "manual")) {
-      if (state_.tl_custom_text.size() < 4) {
+      const size_t max_len = (state_.tl_custom_cursor == 1) ? 2 : 4;
+      if (state_.tl_custom_text.size() < max_len) {
         state_.tl_custom_text.push_back(ch);
         const int val = std::atoi(state_.tl_custom_text.c_str());
         if (state_.tl_custom_cursor == 0) {
           state_.tl_custom_interval_sec = std::clamp(val, 1, 3600);
+        } else if (state_.tl_custom_cursor == 1) {
+          state_.tl_custom_fps = std::clamp(val, 1, 30);
         } else if (state_.tl_custom_stop_mode == "shots") {
           state_.tl_custom_stop_value = std::clamp(val, 1, 9999);
         } else {
@@ -1820,6 +1830,9 @@ bool UiController::handle_tl_custom_key(char ch,
   if (code == KeyCode::Backspace ||
       (code == KeyCode::Char &&
        (ch == '\b' || static_cast<unsigned char>(ch) == 0x7f))) {
+    if (state_.tl_custom_cursor == 1 && state_.tl_custom_text.empty()) {
+      state_.tl_custom_text = std::to_string(std::clamp(state_.tl_custom_fps, 1, 30));
+    }
     if (!state_.tl_custom_text.empty()) {
       state_.tl_custom_text.pop_back();
       const int val =
@@ -1827,6 +1840,8 @@ bool UiController::handle_tl_custom_key(char ch,
                                         : std::atoi(state_.tl_custom_text.c_str());
       if (state_.tl_custom_cursor == 0) {
         state_.tl_custom_interval_sec = std::clamp(val, 1, 3600);
+      } else if (state_.tl_custom_cursor == 1) {
+        state_.tl_custom_fps = std::clamp(val, 1, 30);
       } else if (state_.tl_custom_stop_mode == "shots") {
         state_.tl_custom_stop_value = std::clamp(val, 1, 9999);
       } else if (state_.tl_custom_stop_mode == "duration") {
@@ -1845,9 +1860,8 @@ bool UiController::handle_tl_custom_key(char ch,
       state_.tl_custom_interval_sec =
           std::clamp(state_.tl_custom_interval_sec + delta * step, 1, 3600);
     } else if (state_.tl_custom_cursor == 1) {
-      const int idx = find_index_int(kFpsPresets, state_.tl_custom_fps);
       state_.tl_custom_fps =
-          kFpsPresets[static_cast<size_t>((idx + delta + 3) % 3)];
+          std::clamp(state_.tl_custom_fps + delta, 1, 30);
     } else if (state_.tl_custom_cursor == 2) {
       static constexpr std::array<const char*, 3> kStopModes = {
           "manual", "shots", "duration"};

@@ -307,6 +307,15 @@ void test_config_defaults_roundtrip_and_corrupt_fallback() {
   assert(loaded.ev == custom.ev);
   assert(loaded.camera_transform == custom.camera_transform);
 
+  // Custom timelapse FPS (1..30) round-trips and out-of-range values clamp to [1, 30]
+  custom.timelapse_fps = 12;
+  assert(cz::save_config(custom));
+  assert(cz::load_config().timelapse_fps == 12);
+  write_bytes(env_cfg, "{ \"timelapse_fps\": 0 }");
+  assert(cz::load_config().timelapse_fps == 1);
+  write_bytes(env_cfg, "{ \"timelapse_fps\": 99 }");
+  assert(cz::load_config().timelapse_fps == 30);
+
   // Corrupt JSON falls back gracefully to defaults without throwing
   write_bytes(env_cfg, "{ \"theme\": \"light\", broken_json ");
   const cz::AppConfig recovered = cz::load_config();

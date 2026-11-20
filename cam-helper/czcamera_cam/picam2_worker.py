@@ -614,8 +614,11 @@ class Picam2Worker:
                 self._camera_properties,
                 transform_cls=self._transform_cls,
             )
+            crop_aspect = (16, 9) if _is_16_9_mode(self._mode, req_w, req_h) else (4, 3)
             still_controls = {
-                "ScalerCrop": compute_scaler_crop(self._sensor_size, 4, 3, self._zoom),
+                "ScalerCrop": compute_scaler_crop(
+                    self._sensor_size, crop_aspect[0], crop_aspect[1], self._zoom
+                ),
                 "ExposureValue": float(self._ev),
             }
             still_cfg = self._picam2.create_still_configuration(

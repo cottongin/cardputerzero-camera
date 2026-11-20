@@ -160,6 +160,10 @@ std::vector<std::string> TimelapseEngine::build_compile_command(
       "ffmpeg",
       "-nostdin",
       "-y",
+      "-threads",
+      "1",
+      "-filter_threads",
+      "1",
       "-framerate",
       std::to_string(safe_fps),
       "-start_number",
@@ -168,25 +172,35 @@ std::vector<std::string> TimelapseEngine::build_compile_command(
       input_pattern,
   };
 
-  if (to_lower_ascii(resolution) == "8mp") {
+  // Scale to CM0/VideoCore IV memory-safe dimensions while preserving aspect ratio.
+  if (to_lower_ascii(resolution) == "1080p") {
     args.push_back("-vf");
-    args.push_back("scale=1440:1080:flags=lanczos");
+    args.push_back("scale=1280:720:flags=bilinear,setsar=1");
+  } else {
+    args.push_back("-vf");
+    args.push_back("scale=1024:768:flags=bilinear,setsar=1");
   }
 
   if (use_hw_encoder) {
     args.push_back("-c:v");
     args.push_back("h264_v4l2m2m");
+    args.push_back("-num_output_buffers");
+    args.push_back("4");
     args.push_back("-b:v");
-    args.push_back("6M");
+    args.push_back("5M");
     args.push_back("-pix_fmt");
     args.push_back("yuv420p");
   } else {
     args.push_back("-c:v");
     args.push_back("libx264");
+    args.push_back("-threads");
+    args.push_back("2");
     args.push_back("-preset");
-    args.push_back("veryfast");
+    args.push_back("ultrafast");
     args.push_back("-crf");
-    args.push_back("22");
+    args.push_back("23");
+    args.push_back("-x264-params");
+    args.push_back("rc-lookahead=0:ref=1:bframes=0:threads=2:lookahead-threads=1:sync-lookahead=0");
     args.push_back("-pix_fmt");
     args.push_back("yuv420p");
   }
@@ -246,7 +260,8 @@ bool TimelapseEngine::start(const AppConfig& cfg, uint64_t now_ms) {
   const std::string res =
       cfg.timelapse_resolution.empty() ? "2mp" : to_lower_ascii(cfg.timelapse_resolution);
   const int interval_sec = std::clamp(cfg.timelapse_interval_sec, 1, 3600);
-  const int fps = (cfg.timelapse_fps > 0) ? cfg.timelapse_fps : 24;
+  const int fps =
+      (cfg.timelapse_fps > 0) ? std::clamp(cfg.timelapse_fps, 1, 30) : 24;
 
   TimelapseManifest m;
   m.session_id = paths.session_id;
@@ -576,18 +591,7 @@ bool TimelapseEngine::run_compile_attempt(
           on_progress(cur, total_frames);
         }
       }
-    } else if (line == "progress=end" && total_frames > 0 &&
-               last_reported < total_frames) {
-      last_reported = total_frames;
-      {
-        std::lock_guard<std::mutex> lock(mutex_);
-        state_.compile_current = total_frames;
-        state_.compile_total = total_frames;
-        state_.compile_progress = 1.0f;
-      }
-      if (on_progress) {
-        on_progress(total_frames, total_frames);
-      }
+    // progress=end is emitted even on failed encoder init; leave 100% completion to compile_session() on exit 0.
     }
   };
 
@@ -776,6 +780,11 @@ bool TimelapseEngine::compile_session(
 
   if (!ok && !cancelled) {
     remove_silent(paths.mp4_tmp_path);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      state_.compile_current = 0;
+      state_.compile_progress = 0.0f;
+    }
     ok = run_compile_attempt(ffmpeg, paths, fps, resolution, false,
                              total_frames, on_progress, err);
     std::lock_guard<std::mutex> plock(compile_proc_mutex_);

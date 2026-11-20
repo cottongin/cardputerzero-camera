@@ -21,8 +21,8 @@ The `320×170` canvas splits into two regions whose horizontal side swaps dynami
 ### Photo Mode (`1`)
 - **Resolutions (`R` or card 0):** `8MP` (`3280×2464` JPEG) default, `2MP` (`1640×1232` JPEG).
 - **Digital Crop Zoom vs. Viewfinder Loupe:**
-  - **`5` / `7`**: Steps ISP `ScalerCrop` (`1.0x`, `1.5x`, `2.0x`, `3.0x`, `4.0x`). Both the live preview and captured JPEG are cropped cleanly to that region.
-  - **`L`** (or `l` on Photo idle view): Toggles a **`2x` Viewfinder-Only Loupe** for checking framing/focus without cropping the saved full-resolution photo.
+  - **`5` / `7`**: Steps ISP `ScalerCrop` (`1.0x`, `1.5x`, `2.0x`, `3.0x`, `4.0x`). Both the live preview and captured media are cropped cleanly to that region (active across Photo, Video, and Timelapse).
+  - **`Z`**: Toggles a **`2x` Viewfinder-Only Loupe** for checking framing/focus in Photo, Video, or Timelapse (idle or active capture) without cropping saved images/frames. Lowercase `h` / `l` remain dedicated to `Left` / `Right` `hjkl` navigation everywhere.
 - **Exposure Value (card 1, `Left`/`Right`):** `-2.0` to `+2.0` in `0.5` EV steps.
 - **Photo Filters (`F` or card 2):** Cycles all 9 filters live on the preview and applies them on JPEG save (`None` writes the sensor JPEG directly with zero re-encode):
   `None` (`none`), `B&W` (`bw`), `Hi-Con` (`hicon`), `Sepia` (`sepia`), `Cool` (`cool`), `Vivid` (`vivid`), `Invert` (`invert`), `Retro` (`retro`), `GameBoy` (`gameboy`, scaled integer blocks with 4-shade Bayer DMG palette).
@@ -32,7 +32,7 @@ The `320×170` canvas splits into two regions whose horizontal side swaps dynami
 ### Video Mode (`2`)
 - **Resolutions (`R` or card 0, while idle):** `720p` (`1280×720` @ 30fps, default), `1080p` (`1920×1080` @ 30fps), `480p` (`640×480` @ 30fps).
 - **Audio (`M` or card 1, while idle):** ES8389 MEMS microphone ON by default (`audio=true`). If ALSA capture is unavailable or busy at recording start, `czcamera-cam` emits `audio_unavailable`, shows a warning toast, and falls back to muted `.mp4` recording instead of aborting.
-- **Live Zoom (`5` / `7` or card 2):** Active both before and during recording (`1.0x`–`4.0x`).
+- **Live Zoom & Loupe (`5` / `7` and `Z`):** Zoom (`1.0x`–`4.0x`) and `2x` Loupe remain active both before and during recording.
 - **Storage Indicator (card 3):** Displays read-only `FREE` space remaining on the target mount (`100 MB` minimum enforced every 2 seconds while recording; auto-stops safely if space drops below `100 MB`).
 - **Recording Lock:** While `● REC` is active, mode switches (`1`/`2`/`3`), `[8]` Gallery, `[S]` Settings, `[W]` rail flip, `[T]` theme toggle, `[M]`/`[R]`, and `Q` are locked out. Press `Enter`, `Space`, `6`, or `Esc` to stop recording cleanly.
 
@@ -42,11 +42,12 @@ The `320×170` canvas splits into two regions whose horizontal side swaps dynami
   - **Interval (card 0):** Cycles `2s`, `5s` (default), `10s`, `30s`, `60s`, `300s` (or any custom `1..3600s` via `[C]` / `[P]`).
   - **Output Mode (card 1):** `video` (`TL_<ts>.mp4`, default) or `photos` (`TL_<ts>/frame_0001.jpg`...).
   - **Stop Condition (card 3):** `Manual` (default), `60 shots`, `120 shots`, `300 shots`, `15 min`, `30 min`, `60 min` (or custom via `[C]` / `[P]`).
-- **Custom Input Modal (`C` or `P` while idle):** Adjusts exact Interval (`1..3600s`), FPS (`15`, `24`, `30`), Stop Mode (`manual` / `shots` / `duration`), and Stop Value (`1..9999` shots or `1..1440` min) with numeric digits or `Left`/`Right`. `Enter` saves and closes; `Esc` discards.
-- **MP4 Compilation & VideoCore IV Compliance:**
+- **Live Zoom & Loupe (`5` / `7` and `Z`):** Adjust crop zoom (`1.0x`–`4.0x`) or toggle `2x` viewfinder Loupe both before and during active timelapse capture.
+- **Custom Input Modal (`C` or `P` while idle):** Adjusts exact Interval (`1..3600s`), Video FPS (`1..30` via `Left`/`Right`/`h`/`l` `±1` stepping or typing digits `0-9` + `Backspace`), Stop Mode (`manual` / `shots` / `duration`), and Stop Value (`1..9999` shots or `1..1440` min). `Enter` saves and closes; `Esc` discards.
+- **MP4 Compilation & CM0 Memory/V4L2 Compliance:**
   - Frames stage inside `.tl_work_<ts>/` with a `manifest.json` heartbeat.
-  - On stop/completion in `video` mode, `ffmpeg` prefers hardware `h264_v4l2m2m` (`6M`, `yuv420p`) and automatically falls back to `libx264 -preset veryfast -crf 22 -pix_fmt yuv420p` if hardware encoding fails.
-  - Because Raspberry Pi VideoCore IV's hardware H.264 encoder caps dimensions at `2048px`, **`8MP` (`3280×2464`) frames automatically scale to `1440×1080` (`lanczos`)** during MP4 compile (while individual `Photos`-mode frames remain full `8MP`).
+  - On stop/completion in `video` mode, `ffmpeg` runs single-threaded input/filter decode (`-threads 1 -filter_threads 1`), scales frames cleanly to CM0 hardware-friendly bounds (`1024×768` bilinear for `4:3` `2mp`/`8mp`, `1280×720` bilinear for `16:9` `1080p`), encodes via `h264_v4l2m2m` (`-num_output_buffers 4`, `5M`, `yuv420p`), and automatically falls back to low-RAM `libx264` (`-threads 2 -preset ultrafast -crf 23 -x264-params rc-lookahead=0:ref=1:bframes=0:...`) if hardware init fails.
+  - Individual `Photos`-mode frames remain full native capture resolution (`2MP`, `1080p`, or `8MP`).
   - Press `Esc` during `TimelapseCompiling` to cancel compilation cleanly and preserve the raw frames in a non-hidden `TL_<ts>/` folder.
 - **Auto-Dim & Safe Wake:**
   - When capturing, the screen dims after `timelapse_dim_sec` idle seconds (`15s` default; configurable `15s`/`30s`/`60s`/`Off` in Settings) via `/sys/class/backlight/*/brightness` (or a software black frame fallback on desktop/headless).
@@ -104,7 +105,7 @@ Persisted atomically to `~/.config/czcamera/config.json` (override path with `CZ
 | `timelapse_resolution` | `"2mp"` | `"2mp"`, `"1080p"`, `"8mp"` |
 | `timelapse_interval_sec` | `5` | `1..3600` (seconds) |
 | `timelapse_output_mode` | `"video"` | `"video"`, `"photos"` |
-| `timelapse_fps` | `24` | `15`, `24`, `30` |
+| `timelapse_fps` | `24` | `1..30` |
 | `timelapse_stop_mode` | `"manual"` | `"manual"`, `"shots"`, `"duration"` |
 | `timelapse_stop_value` | `0` | `>= 0` (shot count or seconds when `"duration"`) |
 | `timelapse_dim_sec` | `15` | `0..3600` (`0` = never auto-dim) |
