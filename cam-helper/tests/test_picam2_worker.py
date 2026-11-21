@@ -1,3 +1,4 @@
+import importlib.util
 import os
 import sys
 import tempfile
@@ -1128,19 +1129,58 @@ class Picam2WorkerTest(unittest.TestCase):
 
         fake_simplejpeg = types.ModuleType("simplejpeg")
         fake_simplejpeg.encode_jpeg_yuv_planes = fake_encode_jpeg_yuv_planes
-        with mock.patch.dict(sys.modules, {"simplejpeg": fake_simplejpeg}):
-            jpeg = _default_yuv420_jpeg_encoder(y_np, u_np, v_np, 10, 6, 92)
 
-        self.assertEqual(jpeg, b"\xff\xd8FAKE\xff\xd9")
-        y_2d, u_2d, v_2d, q = captured_arrays[0]
-        self.assertEqual(q, 92)
-        self.assertEqual(y_2d.shape, (6, 10))
-        self.assertEqual(u_2d.shape, (3, 5))
-        self.assertEqual(v_2d.shape, (3, 5))
-        self.assertEqual(str(y_2d.dtype), "uint8")
-        self.assertTrue(y_2d.flags["C_CONTIGUOUS"])
-        self.assertTrue(u_2d.flags["C_CONTIGUOUS"])
-        self.assertTrue(v_2d.flags["C_CONTIGUOUS"])
+        class FakeArray:
+            def __init__(self, data, shape, dtype, contiguous=False):
+                self.data = bytes(data)
+                self.shape = shape
+                self.dtype = dtype
+                self.flags = {"C_CONTIGUOUS": contiguous}
+
+            def reshape(self, *shape):
+                expected = 1
+                for dim in shape:
+                    expected *= dim
+                if len(self.data) != expected:
+                    raise ValueError(f"cannot reshape {len(self.data)} bytes to {shape}")
+                return FakeArray(self.data, shape, self.dtype, contiguous=False)
+
+            def tobytes(self):
+                return self.data
+
+        fake_numpy = types.ModuleType("numpy")
+        fake_numpy.uint8 = "uint8"
+        fake_numpy.frombuffer = lambda buf, dtype=None: FakeArray(
+            buf, (len(buf),), dtype, contiguous=False
+        )
+        fake_numpy.ascontiguousarray = lambda arr: FakeArray(
+            arr.data, arr.shape, arr.dtype, contiguous=True
+        )
+
+        patch_sets = [{"numpy": fake_numpy, "simplejpeg": fake_simplejpeg}]
+        if importlib.util.find_spec("numpy") is not None:
+            patch_sets.append({"simplejpeg": fake_simplejpeg})
+
+        for patches in patch_sets:
+            with mock.patch.dict(sys.modules, patches):
+                jpeg = _default_yuv420_jpeg_encoder(y_np, u_np, v_np, 10, 6, 92)
+
+            self.assertEqual(jpeg, b"\xff\xd8FAKE\xff\xd9")
+            y_2d, u_2d, v_2d, q = captured_arrays[-1]
+            self.assertEqual(q, 92)
+            self.assertEqual(y_2d.shape, (6, 10))
+            self.assertEqual(u_2d.shape, (3, 5))
+            self.assertEqual(v_2d.shape, (3, 5))
+            self.assertEqual(str(y_2d.dtype), "uint8")
+            self.assertEqual(str(u_2d.dtype), "uint8")
+            self.assertEqual(str(v_2d.dtype), "uint8")
+            self.assertTrue(y_2d.flags["C_CONTIGUOUS"])
+            self.assertTrue(u_2d.flags["C_CONTIGUOUS"])
+            self.assertTrue(v_2d.flags["C_CONTIGUOUS"])
+            self.assertEqual(
+                (y_2d.tobytes(), u_2d.tobytes(), v_2d.tobytes()),
+                (y_np, u_np, v_np),
+            )
 
 
 if __name__ == "__main__":
