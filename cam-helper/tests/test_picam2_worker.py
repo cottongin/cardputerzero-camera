@@ -16,6 +16,9 @@ from czcamera_cam.picam2_worker import (
 from czcamera_cam.protocol import FLAG_ASPECT_16_9, PIXFMT_YUV420
 
 
+_UNSET = object()
+
+
 class FakeTransform:
     def __init__(self, hflip=0, vflip=0):
         self.hflip = int(hflip)
@@ -157,11 +160,12 @@ class FakePicamera2:
             **kwargs,
         }
 
-    def create_still_configuration(self, main=None, lores=None, transform=None, **kwargs):
+    def create_still_configuration(self, main=None, lores=None, raw=_UNSET, transform=None, **kwargs):
         return {
             "type": "still",
             "main": main,
             "lores": lores,
+            "raw": {} if raw is _UNSET else raw,
             "transform": transform,
             **kwargs,
         }
@@ -957,6 +961,7 @@ class Picam2WorkerTest(unittest.TestCase):
             self.assertEqual(cfg_8mp["type"], "still")
             self.assertEqual(cfg_8mp["main"], {"size": (3280, 2464), "format": "YUV420"})
             self.assertIsNone(cfg_8mp["lores"])
+            self.assertEqual(cfg_8mp["raw"], {})
             self.assertEqual(cfg_8mp["buffer_count"], 1)
             self.assertEqual(
                 cfg_8mp["controls"],
@@ -1034,15 +1039,22 @@ class Picam2WorkerTest(unittest.TestCase):
 
             # Failure during encode after capture_request -> request still released AND preview restored
             picam.fail_on_still_start = None
+            orig_encoder = worker._yuv_jpeg_encoder
+
             def failing_encoder(*_args):
                 raise RuntimeError("encoder boom")
+
             worker._yuv_jpeg_encoder = failing_encoder
             controls_before = len(picam.controls_history)
-            with self.assertRaisesRegex(RuntimeError, "encoder boom"):
-                worker.capture_still(os.path.join(tmpdir, ".IMG_fail_enc.jpg.tmp"), 3280, 2464)
+            try:
+                with self.assertRaisesRegex(RuntimeError, "encoder boom"):
+                    worker.capture_still(os.path.join(tmpdir, ".IMG_fail_enc.jpg.tmp"), 3280, 2464)
+            finally:
+                worker._yuv_jpeg_encoder = orig_encoder
 
             self.assertTrue(picam.captured_requests[-1][0].released)
             self.assertTrue(picam.started)
+            self.assertTrue(worker._started)
             self.assertEqual(picam.configured["type"], "preview")
             self.assertEqual(picam.configured["main"]["size"], (1640, 1232))
             self.assertIsNotNone(picam.post_callback)
@@ -1070,6 +1082,21 @@ class Picam2WorkerTest(unittest.TestCase):
         # Tight unpadded buffer
         tight = y_np + u_np + v_np
         self.assertEqual(extract_yuv420_planes(tight, 10, 6, stride=None), (y_np, u_np, v_np))
+
+        # Tight unpadded buffer with trailing page-alignment bytes and stride=None must not skew rows
+        self.assertEqual(
+            extract_yuv420_planes(tight + (b"\xaa" * 37), 10, 6, stride=None),
+            (y_np, u_np, v_np),
+        )
+        # Even when extra trailing bytes happen to divide total_rows=9 (90+9=99 -> candidate=11 odd), must not skew
+        self.assertEqual(
+            extract_yuv420_planes(tight + (b"\xaa" * 9), 10, 6, stride=None),
+            (y_np, u_np, v_np),
+        )
+
+        # Explicit stride > width with undersized buffer raises ValueError instead of falling back
+        with self.assertRaises(ValueError):
+            extract_yuv420_planes(tight, 10, 6, stride=16)
 
         # Undersized buffer raises ValueError
         with self.assertRaises(ValueError):

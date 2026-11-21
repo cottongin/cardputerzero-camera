@@ -303,8 +303,7 @@ def _clone_config_dict(config: Any) -> Any:
     if not isinstance(config, dict):
         return config
     cloned = dict(config)
-    for key in ("main", "lores", "raw", "controls"):
-        val = cloned.get(key)
+    for key, val in cloned.items():
         if isinstance(val, dict):
             cloned[key] = dict(val)
     return cloned
@@ -336,13 +335,19 @@ def extract_yuv420_planes(
                 f"YUV420 buffer too small for {w}x{h}: got {buf_len} bytes, need {expected}"
             )
 
-        effective_stride = stride
-        if effective_stride is None or effective_stride <= 0:
-            if buf_len == expected:
-                effective_stride = w
+        if stride is not None and stride > 0:
+            effective_stride = int(stride)
+        elif buf_len == expected:
+            effective_stride = w
+        else:
+            total_rows = h + uv_h
+            if total_rows > 0 and (buf_len % total_rows) == 0:
+                candidate = buf_len // total_rows
+                effective_stride = (
+                    candidate if candidate >= w and (candidate % 2) == 0 else w
+                )
             else:
-                total_rows = h + uv_h
-                effective_stride = (buf_len // total_rows) if total_rows > 0 else w
+                effective_stride = w
 
         if effective_stride <= w:
             return (
@@ -356,10 +361,9 @@ def extract_yuv420_planes(
         v_base = u_base + uv_h * uv_stride
         required_strided = v_base + uv_h * uv_stride
         if buf_len < required_strided:
-            return (
-                bytes(mv[:y_len]),
-                bytes(mv[y_len : y_len + uv_len]),
-                bytes(mv[y_len + uv_len : expected]),
+            raise ValueError(
+                f"YUV420 buffer too small for {w}x{h} with stride {effective_stride}: "
+                f"got {buf_len} bytes, need {required_strided}"
             )
 
         try:
@@ -371,15 +375,15 @@ def extract_yuv420_planes(
             arr = None
             try:
                 arr = np.frombuffer(mv, dtype=np.uint8)
-                y_bytes = np.ascontiguousarray(
-                    arr[:u_base].reshape(h, effective_stride)[:, :w]
-                ).tobytes()
-                u_bytes = np.ascontiguousarray(
-                    arr[u_base:v_base].reshape(uv_h, uv_stride)[:, :uv_w]
-                ).tobytes()
-                v_bytes = np.ascontiguousarray(
-                    arr[v_base:required_strided].reshape(uv_h, uv_stride)[:, :uv_w]
-                ).tobytes()
+                y_bytes = arr[:u_base].reshape(h, effective_stride)[:, :w].tobytes()
+                u_bytes = (
+                    arr[u_base:v_base].reshape(uv_h, uv_stride)[:, :uv_w].tobytes()
+                )
+                v_bytes = (
+                    arr[v_base:required_strided]
+                    .reshape(uv_h, uv_stride)[:, :uv_w]
+                    .tobytes()
+                )
                 return y_bytes, u_bytes, v_bytes
             finally:
                 arr = None
@@ -492,7 +496,6 @@ class Picam2Worker:
         self._ev = 0.0
         self._transform_str = "auto"
         self._is_16_9 = False
-        self._active_config_spec: Optional[dict[str, Any]] = None
         self._active_config: Any = None
         self._last_config_kwargs: Optional[dict[str, Any]] = None
 
@@ -703,16 +706,6 @@ class Picam2Worker:
             self._transform_str = transform
             self._is_16_9 = is_16_9
             self._active_config = saved_config
-            self._active_config_spec = {
-                "mode": mode,
-                "main_w": mw,
-                "main_h": mh,
-                "active_main_size": active_main_size,
-                "preview_w": pw,
-                "preview_h": ph,
-                "fps": req_fps,
-                "transform": transform,
-            }
             self._last_config_kwargs = {
                 "mode": mode,
                 "main_w": mw,
@@ -831,6 +824,7 @@ class Picam2Worker:
                 ),
                 "ExposureValue": float(self._ev),
             }
+            # Retain Picamera2 default raw={} per Spec §5.1 / rpi_apps.yaml (raw_mandatory_stream: true).
             still_cfg = self._picam2.create_still_configuration(
                 main={"size": (req_w, req_h), "format": "YUV420"},
                 lores=None,
@@ -985,7 +979,6 @@ class Picam2Worker:
             self._started = False
             self._active_main_size = None
             self._active_config = None
-            self._active_config_spec = None
             self._lores_stride = None
             self._main_stride = None
         if self._picam2 is not None:
@@ -1018,7 +1011,6 @@ class Picam2Worker:
             self._started = False
             self._active_main_size = None
             self._active_config = None
-            self._active_config_spec = None
         if self._picam2 is not None:
             try:
                 self._picam2.post_callback = None
