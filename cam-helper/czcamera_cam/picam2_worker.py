@@ -293,6 +293,161 @@ def _write_minimal_mp4_stub(path: str) -> int:
     return len(data)
 
 
+def _read_stream_buffer(request: Any, stream_name: str) -> Any:
+    if hasattr(request, "make_buffer"):
+        return request.make_buffer(stream_name)
+    return request.make_array(stream_name).tobytes()
+
+
+def _clone_config_dict(config: Any) -> Any:
+    if not isinstance(config, dict):
+        return config
+    cloned = dict(config)
+    for key in ("main", "lores", "raw", "controls"):
+        val = cloned.get(key)
+        if isinstance(val, dict):
+            cloned[key] = dict(val)
+    return cloned
+
+
+def extract_yuv420_planes(
+    raw: bytes | bytearray | memoryview,
+    width: int,
+    height: int,
+    stride: Optional[int] = None,
+) -> tuple[bytes, bytes, bytes]:
+    """Extract tight (Y, U, V) byte planes from a possibly strided YUV420 buffer."""
+    w = int(width)
+    h = int(height)
+    if w < 2 or h < 2 or (w & 1) or (h & 1):
+        raise ValueError(f"Invalid YUV420 dimensions: {w}x{h}")
+
+    y_len = w * h
+    uv_w = w // 2
+    uv_h = h // 2
+    uv_len = uv_w * uv_h
+    expected = y_len + 2 * uv_len
+
+    mv = memoryview(raw).cast("B")
+    try:
+        buf_len = len(mv)
+        if buf_len < expected:
+            raise ValueError(
+                f"YUV420 buffer too small for {w}x{h}: got {buf_len} bytes, need {expected}"
+            )
+
+        effective_stride = stride
+        if effective_stride is None or effective_stride <= 0:
+            if buf_len == expected:
+                effective_stride = w
+            else:
+                total_rows = h + uv_h
+                effective_stride = (buf_len // total_rows) if total_rows > 0 else w
+
+        if effective_stride <= w:
+            return (
+                bytes(mv[:y_len]),
+                bytes(mv[y_len : y_len + uv_len]),
+                bytes(mv[y_len + uv_len : expected]),
+            )
+
+        uv_stride = effective_stride // 2
+        u_base = h * effective_stride
+        v_base = u_base + uv_h * uv_stride
+        required_strided = v_base + uv_h * uv_stride
+        if buf_len < required_strided:
+            return (
+                bytes(mv[:y_len]),
+                bytes(mv[y_len : y_len + uv_len]),
+                bytes(mv[y_len + uv_len : expected]),
+            )
+
+        try:
+            import numpy as np  # type: ignore[import-not-found]
+        except ImportError:
+            np = None
+
+        if np is not None:
+            arr = None
+            try:
+                arr = np.frombuffer(mv, dtype=np.uint8)
+                y_bytes = np.ascontiguousarray(
+                    arr[:u_base].reshape(h, effective_stride)[:, :w]
+                ).tobytes()
+                u_bytes = np.ascontiguousarray(
+                    arr[u_base:v_base].reshape(uv_h, uv_stride)[:, :uv_w]
+                ).tobytes()
+                v_bytes = np.ascontiguousarray(
+                    arr[v_base:required_strided].reshape(uv_h, uv_stride)[:, :uv_w]
+                ).tobytes()
+                return y_bytes, u_bytes, v_bytes
+            finally:
+                arr = None
+
+        y_out = bytearray(y_len)
+        for r in range(h):
+            row_start = r * effective_stride
+            y_out[r * w : (r + 1) * w] = mv[row_start : row_start + w]
+
+        u_out = bytearray(uv_len)
+        v_out = bytearray(uv_len)
+        for r in range(uv_h):
+            u_start = u_base + r * uv_stride
+            v_start = v_base + r * uv_stride
+            dst = r * uv_w
+            u_out[dst : dst + uv_w] = mv[u_start : u_start + uv_w]
+            v_out[dst : dst + uv_w] = mv[v_start : v_start + uv_w]
+
+        return bytes(y_out), bytes(u_out), bytes(v_out)
+    finally:
+        mv.release()
+
+
+def _default_yuv420_jpeg_encoder(
+    y_bytes: bytes,
+    u_bytes: bytes,
+    v_bytes: bytes,
+    width: int,
+    height: int,
+    quality: int,
+) -> bytes:
+    """Encode tight YUV420 planes to JPEG bytes using simplejpeg."""
+    import numpy as np  # type: ignore[import-not-found]
+    import simplejpeg  # type: ignore[import-not-found]
+
+    y_2d = np.ascontiguousarray(
+        np.frombuffer(y_bytes, dtype=np.uint8).reshape(height, width)
+    )
+    u_2d = np.ascontiguousarray(
+        np.frombuffer(u_bytes, dtype=np.uint8).reshape(height // 2, width // 2)
+    )
+    v_2d = np.ascontiguousarray(
+        np.frombuffer(v_bytes, dtype=np.uint8).reshape(height // 2, width // 2)
+    )
+    return bytes(
+        simplejpeg.encode_jpeg_yuv_planes(y_2d, u_2d, v_2d, quality=int(quality))
+    )
+
+
+def encode_yuv420_to_jpeg(
+    raw: bytes | bytearray | memoryview,
+    width: int,
+    height: int,
+    stride: Optional[int],
+    tmp_path: str,
+    quality: int = 92,
+    encoder: Optional[Callable[[bytes, bytes, bytes, int, int, int], bytes]] = None,
+) -> int:
+    """Strip stride padding from YUV420 raw buffer, encode JPEG, and flush to tmp_path."""
+    y_bytes, u_bytes, v_bytes = extract_yuv420_planes(raw, width, height, stride=stride)
+    encode_fn = encoder if encoder is not None else _default_yuv420_jpeg_encoder
+    jpeg_bytes = encode_fn(y_bytes, u_bytes, v_bytes, width, height, int(quality))
+    with open(tmp_path, "wb") as f:
+        f.write(jpeg_bytes)
+        f.flush()
+    return len(jpeg_bytes)
+
+
 class Picam2Worker:
     """Real Picamera2 dual-stream (main + lores) worker."""
 
@@ -305,6 +460,9 @@ class Picam2Worker:
         encoder_cls: Any = None,
         ffmpeg_output_cls: Any = None,
         audio_probe: Optional[Callable[[], bool]] = None,
+        yuv_jpeg_encoder: Optional[
+            Callable[[bytes, bytes, bytes, int, int, int], bytes]
+        ] = None,
     ) -> None:
         self._frame_writer = frame_writer
         self._emit_event = emit_event
@@ -313,6 +471,7 @@ class Picam2Worker:
         self._encoder_cls = encoder_cls
         self._ffmpeg_output_cls = ffmpeg_output_cls
         self._audio_probe = audio_probe or _probe_alsa_available
+        self._yuv_jpeg_encoder = yuv_jpeg_encoder
 
         self._picam2: Any = None
         self._camera_properties: dict[str, Any] = {}
@@ -324,13 +483,17 @@ class Picam2Worker:
 
         self._mode = "photo"
         self._main_size = (3280, 2464)
+        self._active_main_size: Optional[tuple[int, int]] = None
         self._preview_size = (226, 170)
         self._lores_stride: Optional[int] = None
+        self._main_stride: Optional[int] = None
         self._fps = 30
         self._zoom = 1.0
         self._ev = 0.0
         self._transform_str = "auto"
         self._is_16_9 = False
+        self._active_config_spec: Optional[dict[str, Any]] = None
+        self._active_config: Any = None
         self._last_config_kwargs: Optional[dict[str, Any]] = None
 
         self._video_tmp_path = ""
@@ -376,27 +539,41 @@ class Picam2Worker:
             }
         )
 
-    def _read_negotiated_lores_stride(self, request: Any = None) -> Optional[int]:
+    def _read_negotiated_stream_stride(
+        self, stream_name: str, request: Any = None
+    ) -> Optional[int]:
         if request is not None:
             req_cfg = getattr(request, "config", None)
             if isinstance(req_cfg, dict):
-                lores = req_cfg.get("lores")
-                if isinstance(lores, dict) and isinstance(lores.get("stride"), int) and lores["stride"] > 0:
-                    return int(lores["stride"])
+                stream_cfg = req_cfg.get(stream_name)
+                if (
+                    isinstance(stream_cfg, dict)
+                    and isinstance(stream_cfg.get("stride"), int)
+                    and stream_cfg["stride"] > 0
+                ):
+                    return int(stream_cfg["stride"])
         if self._picam2 is not None:
             stream_cfg_fn = getattr(self._picam2, "stream_configuration", None)
             if callable(stream_cfg_fn):
                 try:
-                    lores = stream_cfg_fn("lores")
-                    if isinstance(lores, dict) and isinstance(lores.get("stride"), int) and lores["stride"] > 0:
-                        return int(lores["stride"])
+                    stream_cfg = stream_cfg_fn(stream_name)
+                    if (
+                        isinstance(stream_cfg, dict)
+                        and isinstance(stream_cfg.get("stride"), int)
+                        and stream_cfg["stride"] > 0
+                    ):
+                        return int(stream_cfg["stride"])
                 except Exception:
                     pass
             cam_cfg = getattr(self._picam2, "camera_config", None)
             if isinstance(cam_cfg, dict):
-                lores = cam_cfg.get("lores")
-                if isinstance(lores, dict) and isinstance(lores.get("stride"), int) and lores["stride"] > 0:
-                    return int(lores["stride"])
+                stream_cfg = cam_cfg.get(stream_name)
+                if (
+                    isinstance(stream_cfg, dict)
+                    and isinstance(stream_cfg.get("stride"), int)
+                    and stream_cfg["stride"] > 0
+                ):
+                    return int(stream_cfg["stride"])
         return None
 
     def _extract_lores_yuv420(
@@ -406,54 +583,12 @@ class Picam2Worker:
         height: int,
         stride_hint: Optional[int] = None,
     ) -> bytes:
-        if hasattr(request, "make_buffer"):
-            raw = request.make_buffer("lores")
-        else:
-            raw = request.make_array("lores").tobytes()
-
-        mv = memoryview(raw).cast("B")
-        expected = width * height * 3 // 2
-        if len(mv) < expected:
-            return bytes(mv)
-
-        stride = self._read_negotiated_lores_stride(request) or stride_hint
-        if stride is None:
-            if len(mv) == expected:
-                return bytes(mv)
-            total_rows = height * 3 // 2
-            stride = (len(mv) // total_rows) if total_rows > 0 else width
-
-        if stride <= width:
-            return bytes(mv[:expected])
-
-        required_strided = (height * stride) + 2 * ((height // 2) * (stride // 2))
-        if len(mv) < required_strided:
-            return bytes(mv[:expected])
-
-        out = bytearray(expected)
-        pos = 0
-        # Y plane
-        for r in range(height):
-            row_start = r * stride
-            out[pos : pos + width] = mv[row_start : row_start + width]
-            pos += width
-
-        # U and V planes
-        uv_w = width // 2
-        uv_h = height // 2
-        uv_stride = stride // 2
-        u_base = height * stride
-        v_base = u_base + uv_h * uv_stride
-        for r in range(uv_h):
-            u_start = u_base + r * uv_stride
-            out[pos : pos + uv_w] = mv[u_start : u_start + uv_w]
-            pos += uv_w
-        for r in range(uv_h):
-            v_start = v_base + r * uv_stride
-            out[pos : pos + uv_w] = mv[v_start : v_start + uv_w]
-            pos += uv_w
-
-        return bytes(out)
+        raw = _read_stream_buffer(request, "lores")
+        stride = self._read_negotiated_stream_stride("lores", request) or stride_hint
+        y_plane, u_plane, v_plane = extract_yuv420_planes(
+            raw, width, height, stride=stride
+        )
+        return y_plane + u_plane + v_plane
 
     def _on_request(self, request: Any) -> None:
         with self._state_lock:
@@ -472,6 +607,39 @@ class Picam2Worker:
     def _current_scaler_crop(self) -> tuple[int, int, int, int]:
         aspect = (16, 9) if self._is_16_9 else (4, 3)
         return compute_scaler_crop(self._sensor_size, aspect[0], aspect[1], self._zoom)
+
+    def _build_active_config(
+        self,
+        mode: str,
+        mw: int,
+        mh: int,
+        pw: int,
+        ph: int,
+        req_fps: int,
+        transform_obj: Any,
+    ) -> tuple[Any, tuple[int, int]]:
+        lores_cfg = {"size": (pw, ph), "format": "YUV420"}
+        if mode == "video":
+            active_size = (mw, mh)
+            config = self._picam2.create_video_configuration(
+                main={"size": active_size, "format": "YUV420"},
+                lores=lores_cfg,
+                raw=None,
+                buffer_count=4,
+                transform=transform_obj,
+                controls={"FrameRate": req_fps},
+            )
+        else:
+            active_size = (1920, 1080) if _is_16_9_mode(mode, mw, mh) else (1640, 1232)
+            config = self._picam2.create_preview_configuration(
+                main={"size": active_size, "format": "YUV420"},
+                lores=lores_cfg,
+                raw=None,
+                buffer_count=2,
+                transform=transform_obj,
+                controls={"FrameRate": req_fps},
+            )
+        return config, active_size
 
     def configure(
         self,
@@ -515,33 +683,36 @@ class Picam2Worker:
             with self._state_lock:
                 self._started = False
 
-        lores_cfg = {"size": (pw, ph), "format": "YUV420"}
-        if mode == "video":
-            config = self._picam2.create_video_configuration(
-                main={"size": (mw, mh), "format": "YUV420"},
-                lores=lores_cfg,
-                transform=transform_obj,
-                controls={"FrameRate": req_fps},
-            )
-        else:
-            config = self._picam2.create_still_configuration(
-                main={"size": (mw, mh), "format": "RGB888"},
-                lores=lores_cfg,
-                transform=transform_obj,
-            )
-
+        config, active_main_size = self._build_active_config(
+            mode, mw, mh, pw, ph, req_fps, transform_obj
+        )
+        saved_config = _clone_config_dict(config)
         self._picam2.configure(config)
-        negotiated_stride = self._read_negotiated_lores_stride()
+        negotiated_lores_stride = self._read_negotiated_stream_stride("lores")
+        negotiated_main_stride = self._read_negotiated_stream_stride("main")
         is_16_9 = _is_16_9_mode(mode, mw, mh)
 
         with self._state_lock:
             self._mode = mode
             self._main_size = (mw, mh)
+            self._active_main_size = active_main_size
             self._preview_size = (pw, ph)
-            self._lores_stride = negotiated_stride
+            self._lores_stride = negotiated_lores_stride
+            self._main_stride = negotiated_main_stride
             self._fps = req_fps
             self._transform_str = transform
             self._is_16_9 = is_16_9
+            self._active_config = saved_config
+            self._active_config_spec = {
+                "mode": mode,
+                "main_w": mw,
+                "main_h": mh,
+                "active_main_size": active_main_size,
+                "preview_w": pw,
+                "preview_h": ph,
+                "fps": req_fps,
+                "transform": transform,
+            }
             self._last_config_kwargs = {
                 "mode": mode,
                 "main_w": mw,
@@ -554,8 +725,20 @@ class Picam2Worker:
                 "transform": transform,
             }
             self._paused = False
-            self._started = True
 
+        self._start_camera_with_callback()
+        self.set_controls(zoom=req_zoom, ev=req_ev)
+        return {
+            "mode": self._mode,
+            "main_w": mw,
+            "main_h": mh,
+            "preview_w": pw,
+            "preview_h": ph,
+        }
+
+    def _start_camera_with_callback(self) -> None:
+        with self._state_lock:
+            self._started = True
         self._picam2.post_callback = self._on_request
         try:
             self._picam2.start()
@@ -565,14 +748,34 @@ class Picam2Worker:
             self._picam2.post_callback = None
             raise
 
-        self.set_controls(zoom=req_zoom, ev=req_ev)
-        return {
-            "mode": self._mode,
-            "main_w": mw,
-            "main_h": mh,
-            "preview_w": pw,
-            "preview_h": ph,
-        }
+    def _capture_main_yuv420_to_jpeg(
+        self,
+        tmp_path: str,
+        width: int,
+        height: int,
+        stride_fallback: Optional[int] = None,
+    ) -> None:
+        request = None
+        raw = None
+        try:
+            request = self._picam2.capture_request()
+            raw = _read_stream_buffer(request, "main")
+            stride = (
+                self._read_negotiated_stream_stride("main", request)
+                or stride_fallback
+            )
+            encode_yuv420_to_jpeg(
+                raw,
+                width,
+                height,
+                stride,
+                tmp_path,
+                encoder=self._yuv_jpeg_encoder,
+            )
+        finally:
+            raw = None
+            if request is not None:
+                request.release()
 
     def set_controls(
         self,
@@ -605,16 +808,23 @@ class Picam2Worker:
 
         req_w = max(2, int(width) & ~1)
         req_h = max(2, int(height) & ~1)
-        needs_mode_switch = self._mode == "video" or (req_w, req_h) != self._main_size
-        if needs_mode_switch and hasattr(
-            self._picam2, "switch_mode_and_capture_file"
-        ):
+        use_fast_path = (
+            self._mode != "video" and (req_w, req_h) == self._active_main_size
+        )
+
+        if use_fast_path:
+            self._capture_main_yuv420_to_jpeg(
+                tmp_path, req_w, req_h, stride_fallback=self._main_stride
+            )
+        else:
             transform_obj = resolve_transform(
                 self._transform_str,
                 self._camera_properties,
                 transform_cls=self._transform_cls,
             )
-            crop_aspect = (16, 9) if _is_16_9_mode(self._mode, req_w, req_h) else (4, 3)
+            crop_aspect = (
+                (16, 9) if _is_16_9_mode(self._mode, req_w, req_h) else (4, 3)
+            )
             still_controls = {
                 "ScalerCrop": compute_scaler_crop(
                     self._sensor_size, crop_aspect[0], crop_aspect[1], self._zoom
@@ -622,16 +832,49 @@ class Picam2Worker:
                 "ExposureValue": float(self._ev),
             }
             still_cfg = self._picam2.create_still_configuration(
-                main={"size": (req_w, req_h), "format": "RGB888"},
-                lores={"size": self._preview_size, "format": "YUV420"},
+                main={"size": (req_w, req_h), "format": "YUV420"},
+                lores=None,
+                buffer_count=1,
                 transform=transform_obj,
                 controls=still_controls,
             )
-            self._picam2.switch_mode_and_capture_file(still_cfg, tmp_path, format="jpeg")
-            # Re-apply active controls after picamera2 restores the prior mode.
-            self.set_controls()
-        else:
-            self._picam2.capture_file(tmp_path, format="jpeg")
+            prior_config = _clone_config_dict(self._active_config)
+            if prior_config is None:
+                prior_config, _ = self._build_active_config(
+                    self._mode,
+                    self._main_size[0],
+                    self._main_size[1],
+                    self._preview_size[0],
+                    self._preview_size[1],
+                    self._fps,
+                    transform_obj,
+                )
+
+            self._picam2.post_callback = None
+            self._picam2.stop()
+            with self._state_lock:
+                self._started = False
+
+            still_started = False
+            try:
+                self._picam2.configure(still_cfg)
+                self._picam2.start()
+                still_started = True
+                self._capture_main_yuv420_to_jpeg(
+                    tmp_path, req_w, req_h, stride_fallback=None
+                )
+            finally:
+                if still_started:
+                    self._picam2.stop()
+                self._picam2.configure(_clone_config_dict(prior_config))
+                self._lores_stride = (
+                    self._read_negotiated_stream_stride("lores") or self._lores_stride
+                )
+                self._main_stride = (
+                    self._read_negotiated_stream_stride("main") or self._main_stride
+                )
+                self._start_camera_with_callback()
+                self.set_controls()
 
         file_bytes = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
         return {"width": req_w, "height": req_h, "bytes": file_bytes}
@@ -740,6 +983,11 @@ class Picam2Worker:
             self._paused = True
             was_started = self._started
             self._started = False
+            self._active_main_size = None
+            self._active_config = None
+            self._active_config_spec = None
+            self._lores_stride = None
+            self._main_stride = None
         if self._picam2 is not None:
             self._picam2.post_callback = None
             if was_started:
@@ -768,6 +1016,9 @@ class Picam2Worker:
             self._paused = True
             was_started = self._started
             self._started = False
+            self._active_main_size = None
+            self._active_config = None
+            self._active_config_spec = None
         if self._picam2 is not None:
             try:
                 self._picam2.post_callback = None
