@@ -90,6 +90,8 @@ struct RenderDirtyTracker {
   bool dimmed = false;
   bool backend_ready = false;
   bool backend_paused = false;
+  bool backend_connecting = false;
+  int backend_connect_attempt = 0;
   bool tl_running = false;
   int tl_shots = 0;
   int tl_next = 0;
@@ -97,6 +99,7 @@ struct RenderDirtyTracker {
   int vid_sec = 0;
   int timer_sec = 0;
   int comp_cur = 0;
+  std::string backend_error;
   std::string toast;
   cz::OverlayModal modal = cz::OverlayModal::None;
 
@@ -108,6 +111,8 @@ struct RenderDirtyTracker {
     dimmed = st.timelapse_dimmed;
     backend_ready = st.backend_ready;
     backend_paused = st.backend_paused;
+    backend_connecting = st.backend_connecting;
+    backend_connect_attempt = st.backend_connect_attempt;
     tl_running = st.timelapse.running;
     tl_shots = st.timelapse.shots_taken;
     tl_next = st.timelapse.next_shot_in_sec;
@@ -115,6 +120,7 @@ struct RenderDirtyTracker {
     vid_sec = st.video_elapsed_sec;
     timer_sec = st.timer_remaining_sec;
     comp_cur = st.timelapse.compile_current;
+    backend_error = st.backend_error;
     toast = st.toast_message;
     modal = st.modal;
   }
@@ -127,6 +133,8 @@ struct RenderDirtyTracker {
            st.timelapse_dimmed != dimmed ||
            st.backend_ready != backend_ready ||
            st.backend_paused != backend_paused ||
+           st.backend_connecting != backend_connecting ||
+           st.backend_connect_attempt != backend_connect_attempt ||
            st.timelapse.running != tl_running ||
            st.timelapse.shots_taken != tl_shots ||
            st.timelapse.next_shot_in_sec != tl_next ||
@@ -134,6 +142,7 @@ struct RenderDirtyTracker {
            st.video_elapsed_sec != vid_sec ||
            st.timer_remaining_sec != timer_sec ||
            st.timelapse.compile_current != comp_cur ||
+           st.backend_error != backend_error ||
            st.toast_message != toast ||
            st.modal != modal;
   }
@@ -844,6 +853,8 @@ int main(int argc, char* argv[]) {
   cz::UiControllerOptions opts;
   opts.output_dir_override = cli.output_dir;
   opts.mock_backend = cli.mock_cam;
+  opts.async_backend_start = !cli.mock_cam;
+  opts.defer_initial_backend_start = (cli.mode_override == "gallery");
 
   cz::UiController ctrl(nullptr, opts);
   const uint64_t now = steady_now_ms();

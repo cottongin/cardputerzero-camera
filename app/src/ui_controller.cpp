@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -199,6 +200,16 @@ TimelapseSessionPaths session_paths_from_manifest(
   return paths;
 }
 
+bool stream_specs_differ(const CameraStreamSpec& a, const CameraStreamSpec& b) {
+  return a.mode != b.mode || a.main_width != b.main_width ||
+         a.main_height != b.main_height ||
+         a.preview_width != b.preview_width ||
+         a.preview_height != b.preview_height || a.fps != b.fps ||
+         std::abs(a.zoom - b.zoom) > 1e-3f ||
+         std::abs(a.ev - b.ev) > 1e-3f ||
+         a.camera_transform != b.camera_transform;
+}
+
 }  // namespace
 
 UiController::UiController(std::unique_ptr<ICameraBackend> backend,
@@ -209,6 +220,7 @@ UiController::UiController(std::unique_ptr<ICameraBackend> backend,
   if (!backend_) {
     backend_ = create_camera_backend(opts_.mock_backend);
   }
+  state_.backend_connect_max_attempts = std::max(1, opts_.startup_max_attempts);
   timelapse_engine_.set_backend(backend_.get());
 }
 
@@ -238,18 +250,30 @@ bool UiController::init(uint64_t now_ms) {
   state_.zoom = 1.0f;
   state_.loupe_enabled = false;
   state_.rail_cursor = 1;
+  state_.backend_connect_max_attempts = std::max(1, opts_.startup_max_attempts);
 
   if (!mkdir_p(state_.effective_output_dir)) {
     set_toast("Output dir unavailable", true, now_ms);
   }
   refresh_storage_stats();
 
-  std::string err;
-  if (backend_ && !backend_->start(build_stream_spec(), err)) {
-    state_.backend_error = err;
-    set_toast(err.empty() ? "Camera start failed" : err, true, now_ms);
+  if (opts_.async_backend_start) {
+    if (!opts_.defer_initial_backend_start) {
+      begin_backend_start_async(now_ms, false);
+    } else {
+      state_.backend_ready = false;
+      state_.backend_paused = false;
+      state_.backend_connecting = false;
+      state_.backend_connect_attempt = 0;
+    }
+  } else {
+    std::string err;
+    if (backend_ && !backend_->start(build_stream_spec(), err)) {
+      state_.backend_error = err;
+      set_toast(err.empty() ? "Camera start failed" : err, true, now_ms);
+    }
+    sync_backend_status();
   }
-  sync_backend_status();
 
   last_activity_ms_ = now_ms;
   initialized_ = true;
@@ -275,6 +299,7 @@ void UiController::shutdown() {
   join_compile_thread();
   backlight_.restore();
   state_.timelapse_dimmed = false;
+  cancel_backend_start_async();
   if (backend_) {
     backend_->stop();
   }
@@ -340,8 +365,14 @@ void UiController::persist_config() {
 
 bool UiController::reconfigure_backend(std::string& out_err) {
   out_err.clear();
+  if (state_.backend_connecting) {
+    return true;
+  }
   if (!backend_) {
     out_err = "No camera backend";
+    return false;
+  }
+  if (!state_.backend_ready && !state_.backend_paused) {
     return false;
   }
   const bool ok = backend_->reconfigure(build_stream_spec(), out_err);
@@ -353,6 +384,9 @@ bool UiController::reconfigure_backend(std::string& out_err) {
 }
 
 void UiController::sync_backend_status() {
+  if (state_.backend_connecting) {
+    return;
+  }
   const bool was_ready = state_.backend_ready;
   if (!backend_) {
     state_.backend_ready = false;
@@ -378,6 +412,237 @@ void UiController::sync_backend_status() {
             : (!state_.backend_error.empty() ? state_.backend_error
                                              : "Camera offline");
     set_toast(msg, true, last_now_ms_);
+  }
+}
+
+void UiController::begin_backend_start_async(uint64_t now_ms,
+                                             bool is_manual_retry) {
+  cancel_backend_start_async();
+  if (!backend_) {
+    state_.backend_ready = false;
+    state_.backend_paused = false;
+    state_.backend_connecting = false;
+    state_.backend_connect_attempt = 0;
+    state_.backend_error = "No camera backend";
+    set_toast("No camera backend", true, now_ms);
+    return;
+  }
+
+  const int max_attempts = std::max(1, opts_.startup_max_attempts);
+  const int base_delay_ms = std::max(0, opts_.startup_retry_base_delay_ms);
+  const CameraStreamSpec spec = build_stream_spec();
+
+  {
+    std::lock_guard<std::mutex> lk(start_mutex_);
+    start_cancel_ = false;
+    start_ok_ = false;
+    start_manual_retry_ = is_manual_retry;
+    start_error_.clear();
+    started_spec_ = CameraStreamSpec{};
+  }
+  start_attempt_.store(1, std::memory_order_release);
+  start_finished_.store(false, std::memory_order_release);
+  start_in_flight_.store(true, std::memory_order_release);
+
+  backend_->reset_start_cancel();
+
+  state_.backend_ready = false;
+  state_.backend_paused = false;
+  state_.backend_connecting = true;
+  state_.backend_connect_attempt = 1;
+  state_.backend_connect_max_attempts = max_attempts;
+  state_.backend_error.clear();
+
+  start_thread_ = std::thread([this, spec, max_attempts, base_delay_ms]() {
+    bool ok = false;
+    std::string last_err;
+    int delay_ms = base_delay_ms;
+
+    for (int attempt = 1; attempt <= max_attempts; ++attempt) {
+      {
+        std::lock_guard<std::mutex> lk(start_mutex_);
+        if (start_cancel_) {
+          break;
+        }
+      }
+      start_attempt_.store(attempt, std::memory_order_release);
+
+      std::string err;
+      ok = backend_->start(spec, err);
+
+      {
+        std::lock_guard<std::mutex> lk(start_mutex_);
+        if (start_cancel_) {
+          ok = false;
+          break;
+        }
+      }
+
+      if (ok) {
+        std::lock_guard<std::mutex> lk(start_mutex_);
+        start_ok_ = true;
+        start_error_.clear();
+        started_spec_ = spec;
+        break;
+      }
+
+      last_err = err.empty() ? "Camera start failed" : err;
+
+      if (attempt < max_attempts) {
+        if (delay_ms > 0) {
+          std::unique_lock<std::mutex> lk(start_mutex_);
+          start_cv_.wait_for(lk, std::chrono::milliseconds(delay_ms),
+                             [&]() { return start_cancel_; });
+          if (start_cancel_) {
+            break;
+          }
+        } else {
+          std::lock_guard<std::mutex> lk(start_mutex_);
+          if (start_cancel_) {
+            break;
+          }
+        }
+        delay_ms = static_cast<int>(
+            std::min<int64_t>(static_cast<int64_t>(delay_ms) * 3, 30000));
+      }
+    }
+
+    bool was_cancelled = false;
+    {
+      std::lock_guard<std::mutex> lk(start_mutex_);
+      was_cancelled = start_cancel_;
+      if (!start_ok_ && !was_cancelled) {
+        start_error_ = last_err;
+      }
+    }
+    if (!was_cancelled) {
+      start_finished_.store(true, std::memory_order_release);
+    }
+    start_in_flight_.store(false, std::memory_order_release);
+  });
+}
+
+void UiController::cancel_backend_start_async() {
+  if (!state_.backend_connecting &&
+      !start_in_flight_.load(std::memory_order_acquire) &&
+      !start_thread_.joinable()) {
+    return;
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(start_mutex_);
+    start_cancel_ = true;
+  }
+  start_cv_.notify_all();
+  if (backend_) {
+    backend_->cancel_start();
+  }
+  if (start_thread_.joinable()) {
+    start_thread_.join();
+  }
+  start_in_flight_.store(false, std::memory_order_release);
+  start_finished_.store(false, std::memory_order_release);
+  state_.backend_connecting = false;
+  state_.backend_connect_attempt = 0;
+
+  if (backend_ && backend_->status().ready) {
+    backend_->stop();
+  }
+  state_.backend_ready = false;
+  state_.backend_paused = false;
+}
+
+void UiController::poll_backend_start_async(uint64_t now_ms) {
+  if (!start_finished_.load(std::memory_order_acquire)) {
+    if (state_.backend_connecting) {
+      state_.backend_connect_attempt =
+          start_attempt_.load(std::memory_order_acquire);
+    }
+    return;
+  }
+
+  if (start_thread_.joinable()) {
+    start_thread_.join();
+  }
+  start_in_flight_.store(false, std::memory_order_release);
+  start_finished_.store(false, std::memory_order_release);
+
+  bool ok = false;
+  bool manual_retry = false;
+  std::string err;
+  CameraStreamSpec started;
+  {
+    std::lock_guard<std::mutex> lk(start_mutex_);
+    ok = start_ok_;
+    manual_retry = start_manual_retry_;
+    err = start_error_;
+    started = started_spec_;
+  }
+
+  state_.backend_connecting = false;
+  state_.backend_connect_attempt = 0;
+
+  if (ok) {
+    state_.backend_ready = true;
+    state_.backend_paused = false;
+    state_.backend_error.clear();
+
+    if (stream_specs_differ(build_stream_spec(), started)) {
+      std::string reconf_err;
+      if (!reconfigure_backend(reconf_err)) {
+        set_toast(reconf_err.empty() ? "Camera reconfigure failed" : reconf_err,
+                  true, now_ms);
+        return;
+      }
+    }
+    if (state_.backend_ready) {
+      set_toast(manual_retry ? "Camera recovered" : "Camera ready", false,
+                now_ms);
+    }
+  } else {
+    state_.backend_ready = false;
+    state_.backend_paused = false;
+    state_.backend_error = err.empty() ? "Camera start failed" : err;
+    set_toast(state_.backend_error, true, now_ms);
+  }
+}
+
+void UiController::apply_live_controls() {
+  if (backend_ && !state_.backend_connecting && state_.backend_ready) {
+    std::string err;
+    backend_->set_controls(state_.zoom, static_cast<float>(state_.config.ev),
+                           err);
+  }
+}
+
+bool UiController::guard_capture_while_connecting(uint64_t now_ms) {
+  if (!state_.backend_connecting) {
+    return false;
+  }
+  set_toast("Connecting to camera...", false, now_ms);
+  return true;
+}
+
+void UiController::suspend_backend_for_modal(std::string* out_err) {
+  if (state_.backend_connecting) {
+    cancel_backend_start_async();
+    return;
+  }
+  if (backend_ && state_.backend_ready && !state_.backend_paused) {
+    std::string local_err;
+    backend_->pause(out_err ? *out_err : local_err);
+    sync_backend_status();
+  }
+}
+
+void UiController::restore_backend_after_modal(uint64_t now_ms) {
+  if (state_.backend_paused && backend_) {
+    std::string err;
+    backend_->resume(err);
+    sync_backend_status();
+  } else if (opts_.async_backend_start && !state_.backend_ready &&
+             !state_.backend_connecting) {
+    begin_backend_start_async(now_ms, false);
   }
 }
 
@@ -420,11 +685,7 @@ void UiController::start_compile_async(
     state_.timelapse_dimmed = false;
   }
 
-  std::string err;
-  if (backend_ && !state_.backend_paused) {
-    backend_->pause(err);
-    sync_backend_status();
-  }
+  suspend_backend_for_modal(nullptr);
 
   compile_fallback_manifest_ = fallback_manifest;
   compile_from_recovery_ = from_recovery;
@@ -486,11 +747,7 @@ void UiController::finish_compile_if_ready(uint64_t now_ms) {
     set_toast(msg.empty() ? "Compile failed" : msg, true, now_ms);
   }
 
-  std::string err;
-  if (backend_) {
-    backend_->resume(err);
-    sync_backend_status();
-  }
+  restore_backend_after_modal(now_ms);
   refresh_storage_stats();
   state_.timelapse = timelapse_engine_.state();
 
@@ -530,6 +787,8 @@ void UiController::tick(uint64_t now_ms) {
     state_.toast_message.clear();
     state_.toast_is_error = false;
   }
+
+  poll_backend_start_async(now_ms);
 
   if (state_.timer_active) {
     if (now_ms >= timer_target_ms_) {
@@ -656,10 +915,7 @@ void UiController::adjust_zoom(int delta_step) {
     return;
   }
   state_.zoom = kZoomSteps[static_cast<size_t>(next_idx)];
-  if (backend_) {
-    std::string err;
-    backend_->set_controls(state_.zoom, static_cast<float>(state_.config.ev), err);
-  }
+  apply_live_controls();
 }
 
 void UiController::adjust_ev(int delta_step) {
@@ -669,10 +925,7 @@ void UiController::adjust_ev(int delta_step) {
     return;
   }
   state_.config.ev = next_ev;
-  if (backend_) {
-    std::string err;
-    backend_->set_controls(state_.zoom, static_cast<float>(state_.config.ev), err);
-  }
+  apply_live_controls();
   persist_config();
 }
 
@@ -780,7 +1033,7 @@ void UiController::adjust_rail_setting(int delta) {
 }
 
 void UiController::trigger_photo_shutter(uint64_t now_ms) {
-  if (state_.timer_active) {
+  if (state_.timer_active || guard_capture_while_connecting(now_ms)) {
     return;
   }
   if (state_.config.photo_timer_sec > 0) {
@@ -794,6 +1047,9 @@ void UiController::trigger_photo_shutter(uint64_t now_ms) {
 }
 
 void UiController::capture_photo_now(uint64_t now_ms) {
+  if (guard_capture_while_connecting(now_ms)) {
+    return;
+  }
   if (!backend_ || !state_.backend_ready || state_.backend_paused) {
     set_toast("Camera not ready", true, now_ms);
     return;
@@ -837,7 +1093,7 @@ void UiController::capture_photo_now(uint64_t now_ms) {
 }
 
 void UiController::start_video_recording(uint64_t now_ms) {
-  if (state_.video_recording) {
+  if (state_.video_recording || guard_capture_while_connecting(now_ms)) {
     return;
   }
   if (!backend_ || !state_.backend_ready || state_.backend_paused) {
@@ -908,7 +1164,12 @@ void UiController::stop_video_recording(bool low_storage, uint64_t now_ms) {
 }
 
 void UiController::start_timelapse(uint64_t now_ms) {
-  if (timelapse_engine_.state().running || compile_in_flight_.load()) {
+  if (timelapse_engine_.state().running || compile_in_flight_.load() ||
+      guard_capture_while_connecting(now_ms)) {
+    return;
+  }
+  if (!backend_ || !state_.backend_ready || state_.backend_paused) {
+    set_toast("Camera not ready", true, now_ms);
     return;
   }
   if (!timelapse_engine_.start(effective_engine_config(), now_ms)) {
@@ -921,10 +1182,7 @@ void UiController::start_timelapse(uint64_t now_ms) {
 
 void UiController::open_gallery(uint64_t now_ms) {
   std::string err;
-  if (backend_ && !state_.backend_paused) {
-    backend_->pause(err);
-    sync_backend_status();
-  }
+  suspend_backend_for_modal(&err);
   gallery_store_.refresh(state_.effective_output_dir);
   state_.gallery_items = gallery_store_.items();
   state_.gallery_in_session = gallery_store_.in_session();
@@ -945,10 +1203,8 @@ void UiController::close_gallery(bool resume_camera) {
   has_gallery_preview_ = false;
   state_.gallery_delete_confirm = false;
   state_.modal = OverlayModal::None;
-  if (resume_camera && backend_) {
-    std::string err;
-    backend_->resume(err);
-    sync_backend_status();
+  if (resume_camera) {
+    restore_backend_after_modal(last_now_ms_);
   }
 }
 
@@ -1323,7 +1579,14 @@ bool UiController::handle_none_modal_key(char ch,
       persist_config();
       return true;
     case 'r':
+      if (state_.backend_connecting) {
+        return true;
+      }
       if (!state_.backend_ready && backend_) {
+        if (opts_.async_backend_start) {
+          begin_backend_start_async(now_ms, true);
+          return true;
+        }
         std::string err;
         if (backend_->start(build_stream_spec(), err)) {
           set_toast("Camera recovered", false, now_ms);

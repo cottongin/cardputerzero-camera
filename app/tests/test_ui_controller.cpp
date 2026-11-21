@@ -5,13 +5,17 @@
 #include "storage.hpp"
 #include "ui_controller.hpp"
 
+#include <atomic>
 #include <cassert>
 #include <chrono>
+#include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -215,6 +219,156 @@ class DropSimBackend final : public cz::ICameraBackend {
   std::string forced_error;
 
  private:
+  cz::SimCameraBackend inner_;
+};
+
+class AsyncTestBackend final : public cz::ICameraBackend {
+ public:
+  void set_fail_count(int n, const std::string& err = "Transient error") {
+    std::lock_guard<std::mutex> lk(mu_);
+    fail_remaining_ = n;
+    fail_error_ = err;
+  }
+
+  void set_block_start(bool block) {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      block_start_ = block;
+    }
+    cv_.notify_all();
+  }
+
+  bool wait_for_start_entered(int min_calls, int timeout_ms) {
+    std::unique_lock<std::mutex> lk(mu_);
+    return cv_.wait_for(lk, std::chrono::milliseconds(timeout_ms), [&]() {
+      return start_calls.load(std::memory_order_acquire) >= min_calls;
+    });
+  }
+
+  bool start(const cz::CameraStreamSpec& initial_spec,
+             std::string& out_err) override {
+    std::unique_lock<std::mutex> lk(mu_);
+    start_calls.fetch_add(1, std::memory_order_acq_rel);
+    last_started_spec = initial_spec;
+    cv_.notify_all();
+
+    cv_.wait(lk, [&]() { return !block_start_ || cancelled_; });
+    if (cancelled_) {
+      out_err = "camera startup cancelled";
+      last_error_ = out_err;
+      return false;
+    }
+    if (fail_remaining_ > 0) {
+      --fail_remaining_;
+      out_err = fail_error_;
+      last_error_ = out_err;
+      return false;
+    }
+    lk.unlock();
+    const bool ok = inner_.start(initial_spec, out_err);
+    lk.lock();
+    last_error_ = ok ? "" : out_err;
+    return ok;
+  }
+
+  void cancel_start() override {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      cancelled_ = true;
+      cancel_calls.fetch_add(1, std::memory_order_acq_rel);
+    }
+    cv_.notify_all();
+  }
+
+  void reset_start_cancel() override {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      cancelled_ = false;
+      reset_cancel_calls.fetch_add(1, std::memory_order_acq_rel);
+    }
+    cv_.notify_all();
+  }
+
+  void stop() override { inner_.stop(); }
+
+  bool reconfigure(const cz::CameraStreamSpec& spec,
+                   std::string& out_err) override {
+    reconfigure_calls.fetch_add(1, std::memory_order_acq_rel);
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      last_reconfigured_spec = spec;
+    }
+    return inner_.reconfigure(spec, out_err);
+  }
+
+  bool set_controls(float zoom, float ev, std::string& out_err) override {
+    set_controls_calls.fetch_add(1, std::memory_order_acq_rel);
+    return inner_.set_controls(zoom, ev, out_err);
+  }
+
+  bool pause(std::string& out_err) override {
+    pause_calls.fetch_add(1, std::memory_order_acq_rel);
+    return inner_.pause(out_err);
+  }
+
+  bool resume(std::string& out_err) override {
+    resume_calls.fetch_add(1, std::memory_order_acq_rel);
+    return inner_.resume(out_err);
+  }
+
+  bool copy_latest_preview(uint64_t last_seen_seq,
+                           cz::PreviewFrame& out_frame) override {
+    return inner_.copy_latest_preview(last_seen_seq, out_frame);
+  }
+
+  cz::StillCaptureResult capture_still(const std::string& tmp_jpeg_path,
+                                       int width,
+                                       int height) override {
+    capture_still_calls.fetch_add(1, std::memory_order_acq_rel);
+    return inner_.capture_still(tmp_jpeg_path, width, height);
+  }
+
+  bool start_video(const cz::VideoSpec& spec, std::string& out_err) override {
+    start_video_calls.fetch_add(1, std::memory_order_acq_rel);
+    return inner_.start_video(spec, out_err);
+  }
+
+  cz::VideoStopResult stop_video() override { return inner_.stop_video(); }
+
+  cz::BackendHealth status() const override {
+    cz::BackendHealth h = inner_.status();
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!h.ready && !last_error_.empty()) {
+      h.last_error = last_error_;
+    }
+    return h;
+  }
+
+  cz::CameraStreamSpec reconfigured_spec_snapshot() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return last_reconfigured_spec;
+  }
+
+  std::atomic<int> start_calls{0};
+  std::atomic<int> cancel_calls{0};
+  std::atomic<int> reset_cancel_calls{0};
+  std::atomic<int> reconfigure_calls{0};
+  std::atomic<int> set_controls_calls{0};
+  std::atomic<int> pause_calls{0};
+  std::atomic<int> resume_calls{0};
+  std::atomic<int> capture_still_calls{0};
+  std::atomic<int> start_video_calls{0};
+  cz::CameraStreamSpec last_started_spec;
+  cz::CameraStreamSpec last_reconfigured_spec;
+
+ private:
+  mutable std::mutex mu_;
+  std::condition_variable cv_;
+  bool block_start_ = false;
+  bool cancelled_ = false;
+  int fail_remaining_ = 0;
+  std::string fail_error_ = "Transient error";
+  std::string last_error_;
   cz::SimCameraBackend inner_;
 };
 
@@ -1196,6 +1350,491 @@ void test_evdev_repeat_guard_suppresses_wake_key_repeats() {
   assert(ctrl.state().modal == cz::OverlayModal::TimelapseStopConfirm);
 }
 
+void test_async_startup_auto_retry_and_manual_retry() {
+  TempDir tmp("async_retry");
+  const std::string cfg_path = tmp.path + "/config.json";
+  const std::string out_dir = tmp.path + "/out";
+  assert(cz::mkdir_p(out_dir));
+
+  cz::AppConfig cfg;
+  cfg.output_dir = out_dir;
+  assert(cz::save_config(cfg, cfg_path));
+
+  cz::UiControllerOptions opts;
+  opts.config_path = cfg_path;
+  opts.backlight_sysfs_root = tmp.path + "/no_backlight";
+  opts.skip_startup_recovery_scan = true;
+  opts.async_backend_start = true;
+  opts.startup_max_attempts = 3;
+  opts.startup_retry_base_delay_ms = 20;
+
+  // Case A: fail first 2 attempts, succeed on attempt 3
+  {
+    auto be_owned = std::make_unique<AsyncTestBackend>();
+    AsyncTestBackend* be = be_owned.get();
+    be->set_fail_count(2, "Transient error");
+
+    cz::UiController ctrl(std::move(be_owned), opts);
+    uint64_t now = 1000;
+    assert(ctrl.init(now));
+    assert(ctrl.state().backend_connecting);
+    assert(!ctrl.state().backend_ready);
+    assert(ctrl.state().backend_connect_max_attempts == 3);
+
+    const auto dl = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (ctrl.state().backend_connecting &&
+           std::chrono::steady_clock::now() < dl) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      now += 10;
+      ctrl.tick(now);
+    }
+    assert(!ctrl.state().backend_connecting);
+    assert(ctrl.state().backend_ready);
+    assert(be->start_calls.load() == 3);
+    assert(ctrl.state().toast_message == "Camera ready");
+    assert(!ctrl.state().toast_is_error);
+    assert(ctrl.state().backend_error.empty());
+  }
+
+  // Case B: all 3 attempts fail -> persistent error line renders; manual [R] recovers
+  {
+    auto be_owned = std::make_unique<AsyncTestBackend>();
+    AsyncTestBackend* be = be_owned.get();
+    be->set_fail_count(3, "Transient error");
+
+    cz::UiController ctrl(std::move(be_owned), opts);
+    uint64_t now = 1000;
+    assert(ctrl.init(now));
+    assert(ctrl.state().backend_connecting);
+
+    const auto dl = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (ctrl.state().backend_connecting &&
+           std::chrono::steady_clock::now() < dl) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      now += 10;
+      ctrl.tick(now);
+    }
+    assert(!ctrl.state().backend_connecting);
+    assert(!ctrl.state().backend_ready);
+    assert(be->start_calls.load() == 3);
+    assert(ctrl.state().backend_error == "Transient error");
+    assert(ctrl.state().toast_is_error);
+
+    cz::AppView view;
+    view.apply_theme(ctrl.state().theme);
+    view.render(ctrl.state(), nullptr, nullptr);
+    const std::vector<uint32_t> offline_with_err(
+        view.pixels(),
+        view.pixels() + cz::AppView::kWidth * cz::AppView::kHeight);
+
+    cz::UiState offline_no_err = ctrl.state();
+    offline_no_err.backend_error.clear();
+    view.render(offline_no_err, nullptr, nullptr);
+    const std::vector<uint32_t> offline_without_err(
+        view.pixels(),
+        view.pixels() + cz::AppView::kWidth * cz::AppView::kHeight);
+    assert(offline_with_err != offline_without_err);
+
+    // Check connecting render states (attempt 1 vs attempt 2) also render distinctly
+    cz::UiState conn1 = offline_no_err;
+    conn1.backend_connecting = true;
+    conn1.backend_connect_attempt = 1;
+    conn1.backend_connect_max_attempts = 3;
+    view.render(conn1, nullptr, nullptr);
+    const std::vector<uint32_t> conn1_px(
+        view.pixels(),
+        view.pixels() + cz::AppView::kWidth * cz::AppView::kHeight);
+
+    cz::UiState conn2 = conn1;
+    conn2.backend_connect_attempt = 2;
+    view.render(conn2, nullptr, nullptr);
+    const std::vector<uint32_t> conn2_px(
+        view.pixels(),
+        view.pixels() + cz::AppView::kWidth * cz::AppView::kHeight);
+    assert(conn1_px != offline_without_err);
+    assert(conn2_px != conn1_px);
+
+    // Manual [R] starts async retry immediately and recovers
+    be->set_block_start(true);
+    now += 100;
+    ctrl.handle_key('r', cz::KeyCode::Char, now);
+    assert(ctrl.state().backend_connecting);
+    assert(!ctrl.state().backend_ready);
+
+    be->set_block_start(false);
+    const auto dl2 =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (ctrl.state().backend_connecting &&
+           std::chrono::steady_clock::now() < dl2) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      now += 10;
+      ctrl.tick(now);
+    }
+    assert(!ctrl.state().backend_connecting);
+    assert(ctrl.state().backend_ready);
+    assert(ctrl.state().toast_message == "Camera recovered");
+    assert(!ctrl.state().toast_is_error);
+    assert(ctrl.state().backend_error.empty());
+  }
+}
+
+void test_async_startup_mode_change_while_connecting_reconfigures_on_ready() {
+  TempDir tmp("async_mode_change");
+  const std::string cfg_path = tmp.path + "/config.json";
+  const std::string out_dir = tmp.path + "/out";
+  assert(cz::mkdir_p(out_dir));
+
+  cz::AppConfig cfg;
+  cfg.output_dir = out_dir;
+  assert(cz::save_config(cfg, cfg_path));
+
+  auto be_owned = std::make_unique<AsyncTestBackend>();
+  AsyncTestBackend* be = be_owned.get();
+  be->set_block_start(true);
+
+  cz::UiControllerOptions opts;
+  opts.config_path = cfg_path;
+  opts.backlight_sysfs_root = tmp.path + "/no_backlight";
+  opts.skip_startup_recovery_scan = true;
+  opts.async_backend_start = true;
+  opts.startup_max_attempts = 3;
+  opts.startup_retry_base_delay_ms = 20;
+
+  cz::UiController ctrl(std::move(be_owned), opts);
+  uint64_t now = 1000;
+  assert(ctrl.init(now));
+  assert(be->wait_for_start_entered(1, 2000));
+  assert(ctrl.state().backend_connecting);
+
+  // Switch to Video, adjust zoom, toggle theme, and ensure [R] is safe no-op
+  ctrl.handle_key('2', cz::KeyCode::Char, now);
+  assert(ctrl.state().mode == cz::AppMode::Video);
+  ctrl.handle_key('7', cz::KeyCode::Char, now);
+  assert(ctrl.state().zoom == 1.5f);
+  ctrl.handle_key('t', cz::KeyCode::Char, now);
+  assert(ctrl.state().theme == cz::ThemeMode::Light);
+  ctrl.handle_key('r', cz::KeyCode::Char, now);
+  assert(ctrl.state().config.video_resolution == "720p");
+
+  // Capture / record while connecting shows toast without invoking backend capture
+  ctrl.handle_key(0, cz::KeyCode::Enter, now);
+  assert(ctrl.state().toast_message == "Connecting to camera...");
+  assert(!ctrl.state().toast_is_error);
+  assert(!ctrl.state().video_recording);
+  assert(be->capture_still_calls.load() == 0);
+  assert(be->start_video_calls.load() == 0);
+
+  // Also tick while connecting: must not emit "Camera offline" or race backend
+  now += 50;
+  ctrl.tick(now);
+  assert(ctrl.state().backend_connecting);
+  assert(ctrl.state().toast_message == "Connecting to camera...");
+  assert(be->reconfigure_calls.load() == 0);
+  assert(be->set_controls_calls.load() == 0);
+
+  // Unblock start() and poll tick() until ready
+  be->set_block_start(false);
+  const auto dl = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (ctrl.state().backend_connecting &&
+         std::chrono::steady_clock::now() < dl) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    now += 10;
+    ctrl.tick(now);
+  }
+  assert(!ctrl.state().backend_connecting);
+  assert(ctrl.state().backend_ready);
+  assert(be->reconfigure_calls.load() == 1);
+  const cz::CameraStreamSpec reconf = be->reconfigured_spec_snapshot();
+  assert(reconf.mode == "video");
+  assert(std::abs(reconf.zoom - 1.5f) < 1e-4f);
+}
+
+void test_async_startup_cancel_on_recovery_compile_and_gallery() {
+  // Part A: TimelapseRecovery [C] cancels in-flight async startup, compiles, then reconnects
+  {
+    TempDir tmp("async_recovery_cancel");
+    const std::string cfg_path = tmp.path + "/config.json";
+    const std::string out_dir = tmp.path + "/out";
+    assert(cz::mkdir_p(out_dir));
+
+    cz::AppConfig cfg;
+    cfg.output_dir = out_dir;
+    assert(cz::save_config(cfg, cfg_path));
+
+    const cz::TimelapseSessionPaths orphan_paths =
+        cz::create_timelapse_session(out_dir, true);
+    {
+      cz::SimCameraBackend sim;
+      cz::CameraStreamSpec sp;
+      std::string err;
+      assert(sim.start(sp, err));
+      for (int idx = 1; idx <= 2; ++idx) {
+        const cz::StagedPaths f =
+            cz::next_timelapse_frame_paths(orphan_paths.work_dir, idx);
+        assert(sim.capture_still(f.tmp_path, 320, 240).ok);
+        assert(cz::commit_staged_file(f.tmp_path, f.final_path, err));
+      }
+      sim.stop();
+    }
+    cz::TimelapseManifest m;
+    m.session_id = orphan_paths.session_id;
+    m.work_dir = orphan_paths.work_dir;
+    m.resolution = "2mp";
+    m.interval_sec = 5;
+    m.fps = 24;
+    m.frame_count = 2;
+    m.status = "recording";
+    assert(cz::write_timelapse_manifest(orphan_paths.manifest_path, m));
+
+    auto be_owned = std::make_unique<AsyncTestBackend>();
+    AsyncTestBackend* be = be_owned.get();
+    be->set_block_start(true);
+
+    cz::UiControllerOptions opts;
+    opts.config_path = cfg_path;
+    opts.backlight_sysfs_root = tmp.path + "/no_backlight";
+    opts.skip_startup_recovery_scan = false;
+    opts.async_backend_start = true;
+    opts.startup_max_attempts = 3;
+    opts.startup_retry_base_delay_ms = 20;
+
+    cz::UiController ctrl(std::move(be_owned), opts);
+    uint64_t now = 1000;
+    assert(ctrl.init(now));
+    assert(be->wait_for_start_entered(1, 2000));
+    assert(ctrl.state().modal == cz::OverlayModal::TimelapseRecovery);
+    assert(ctrl.state().backend_connecting);
+
+    ctrl.handle_key('c', cz::KeyCode::Char, now);
+    assert(ctrl.state().modal == cz::OverlayModal::TimelapseCompiling);
+    assert(be->cancel_calls.load() >= 1);
+    assert(be->pause_calls.load() == 0);
+    assert(!ctrl.state().backend_connecting);
+
+    const auto dl = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+    while (ctrl.state().modal == cz::OverlayModal::TimelapseCompiling &&
+           std::chrono::steady_clock::now() < dl) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      now += 20;
+      ctrl.tick(now);
+    }
+    assert(ctrl.state().modal == cz::OverlayModal::None);
+    assert(count_files_with_ext(out_dir, ".mp4") == 1);
+    assert(be->reset_cancel_calls.load() >= 1);
+    assert(ctrl.state().backend_connecting);
+
+    be->set_block_start(false);
+    const auto dl2 =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (ctrl.state().backend_connecting &&
+           std::chrono::steady_clock::now() < dl2) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      now += 10;
+      ctrl.tick(now);
+    }
+    assert(!ctrl.state().backend_connecting);
+    assert(ctrl.state().backend_ready);
+  }
+
+  // Part B: Gallery [8] while connecting cancels start, Esc reconnects
+  {
+    TempDir tmp("async_gallery_cancel");
+    const std::string cfg_path = tmp.path + "/config.json";
+    const std::string out_dir = tmp.path + "/out";
+    assert(cz::mkdir_p(out_dir));
+
+    cz::AppConfig cfg;
+    cfg.output_dir = out_dir;
+    assert(cz::save_config(cfg, cfg_path));
+
+    auto be_owned = std::make_unique<AsyncTestBackend>();
+    AsyncTestBackend* be = be_owned.get();
+    be->set_block_start(true);
+
+    cz::UiControllerOptions opts;
+    opts.config_path = cfg_path;
+    opts.backlight_sysfs_root = tmp.path + "/no_backlight";
+    opts.skip_startup_recovery_scan = true;
+    opts.async_backend_start = true;
+    opts.startup_max_attempts = 3;
+    opts.startup_retry_base_delay_ms = 20;
+
+    cz::UiController ctrl(std::move(be_owned), opts);
+    uint64_t now = 1000;
+    assert(ctrl.init(now));
+    assert(be->wait_for_start_entered(1, 2000));
+    assert(ctrl.state().backend_connecting);
+
+    ctrl.handle_key('8', cz::KeyCode::Char, now);
+    assert(ctrl.state().modal == cz::OverlayModal::Gallery);
+    assert(be->cancel_calls.load() >= 1);
+    assert(be->pause_calls.load() == 0);
+    assert(!ctrl.state().backend_connecting);
+
+    be->set_block_start(false);
+    ctrl.handle_key(0, cz::KeyCode::Esc, now);
+    assert(ctrl.state().modal == cz::OverlayModal::None);
+    assert(be->reset_cancel_calls.load() >= 1);
+    assert(ctrl.state().backend_connecting);
+
+    const auto dl = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (ctrl.state().backend_connecting &&
+           std::chrono::steady_clock::now() < dl) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      now += 10;
+      ctrl.tick(now);
+    }
+    assert(!ctrl.state().backend_connecting);
+    assert(ctrl.state().backend_ready);
+  }
+
+  // Part C: defer_initial_backend_start (--mode gallery) defers until Gallery closes
+  {
+    TempDir tmp("async_gallery_defer");
+    const std::string cfg_path = tmp.path + "/config.json";
+    const std::string out_dir = tmp.path + "/out";
+    assert(cz::mkdir_p(out_dir));
+
+    cz::AppConfig cfg;
+    cfg.output_dir = out_dir;
+    assert(cz::save_config(cfg, cfg_path));
+
+    auto be_owned = std::make_unique<AsyncTestBackend>();
+    AsyncTestBackend* be = be_owned.get();
+
+    cz::UiControllerOptions opts;
+    opts.config_path = cfg_path;
+    opts.backlight_sysfs_root = tmp.path + "/no_backlight";
+    opts.skip_startup_recovery_scan = true;
+    opts.async_backend_start = true;
+    opts.defer_initial_backend_start = true;
+    opts.startup_max_attempts = 3;
+    opts.startup_retry_base_delay_ms = 20;
+
+    cz::UiController ctrl(std::move(be_owned), opts);
+    uint64_t now = 1000;
+    assert(ctrl.init(now));
+    assert(be->start_calls.load() == 0);
+    assert(!ctrl.state().backend_connecting);
+    assert(!ctrl.state().backend_ready);
+
+    ctrl.handle_key('8', cz::KeyCode::Char, now);
+    assert(ctrl.state().modal == cz::OverlayModal::Gallery);
+    assert(be->start_calls.load() == 0);
+    assert(be->pause_calls.load() == 0);
+    assert(ctrl.state().toast_message.empty());
+
+    ctrl.handle_key(0, cz::KeyCode::Esc, now);
+    assert(ctrl.state().modal == cz::OverlayModal::None);
+    assert(ctrl.state().backend_connecting);
+
+    const auto dl = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (ctrl.state().backend_connecting &&
+           std::chrono::steady_clock::now() < dl) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      now += 10;
+      ctrl.tick(now);
+    }
+    assert(be->start_calls.load() == 1);
+    assert(!ctrl.state().backend_connecting);
+    assert(ctrl.state().backend_ready);
+  }
+}
+
+void test_async_startup_shutdown_during_connect_exits_promptly() {
+  // Case A: shutdown while start() is blocked
+  {
+    TempDir tmp("async_shutdown_blocked");
+    const std::string cfg_path = tmp.path + "/config.json";
+    const std::string out_dir = tmp.path + "/out";
+    assert(cz::mkdir_p(out_dir));
+
+    cz::AppConfig cfg;
+    cfg.output_dir = out_dir;
+    assert(cz::save_config(cfg, cfg_path));
+
+    auto be_owned = std::make_unique<AsyncTestBackend>();
+    AsyncTestBackend* be = be_owned.get();
+    be->set_block_start(true);
+
+    cz::UiControllerOptions opts;
+    opts.config_path = cfg_path;
+    opts.backlight_sysfs_root = tmp.path + "/no_backlight";
+    opts.skip_startup_recovery_scan = true;
+    opts.async_backend_start = true;
+    opts.startup_max_attempts = 3;
+    opts.startup_retry_base_delay_ms = 5000;
+
+    cz::UiController ctrl(std::move(be_owned), opts);
+    uint64_t now = 1000;
+    assert(ctrl.init(now));
+    assert(be->wait_for_start_entered(1, 2000));
+    assert(ctrl.state().backend_connecting);
+
+    ctrl.handle_key('q', cz::KeyCode::Char, now);
+    assert(ctrl.should_quit());
+
+    const auto t0 = std::chrono::steady_clock::now();
+    ctrl.shutdown();
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0)
+            .count();
+    assert(elapsed_ms < 1000);
+    assert(be->cancel_calls.load() >= 1);
+    assert(!ctrl.state().backend_connecting);
+    assert(!ctrl.state().backend_ready);
+    assert(ctrl.state().toast_message.empty());
+  }
+
+  // Case B: shutdown during 5000ms retry backoff sleeps wakes immediately
+  {
+    TempDir tmp("async_shutdown_backoff");
+    const std::string cfg_path = tmp.path + "/config.json";
+    const std::string out_dir = tmp.path + "/out";
+    assert(cz::mkdir_p(out_dir));
+
+    cz::AppConfig cfg;
+    cfg.output_dir = out_dir;
+    assert(cz::save_config(cfg, cfg_path));
+
+    auto be_owned = std::make_unique<AsyncTestBackend>();
+    AsyncTestBackend* be = be_owned.get();
+    be->set_fail_count(3, "Transient error");
+
+    cz::UiControllerOptions opts;
+    opts.config_path = cfg_path;
+    opts.backlight_sysfs_root = tmp.path + "/no_backlight";
+    opts.skip_startup_recovery_scan = true;
+    opts.async_backend_start = true;
+    opts.startup_max_attempts = 3;
+    opts.startup_retry_base_delay_ms = 5000;
+
+    cz::UiController ctrl(std::move(be_owned), opts);
+    uint64_t now = 1000;
+    assert(ctrl.init(now));
+    assert(be->wait_for_start_entered(1, 2000));
+    // Give start_thread_ a brief moment to return from attempt 1 and enter CV wait
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+
+    ctrl.handle_key('q', cz::KeyCode::Char, now);
+    assert(ctrl.should_quit());
+
+    const auto t0 = std::chrono::steady_clock::now();
+    ctrl.shutdown();
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0)
+            .count();
+    assert(elapsed_ms < 1000);
+    assert(be->cancel_calls.load() >= 1);
+    assert(be->start_calls.load() == 1);
+    assert(!ctrl.state().backend_connecting);
+    assert(!ctrl.state().backend_ready);
+    assert(ctrl.state().toast_message.empty());
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -1208,6 +1847,10 @@ int main() {
   test_backend_drop_toast_and_stale_live_frame_rendering();
   test_timelapse_photos_auto_finish_clears_stop_confirm_modal();
   test_evdev_repeat_guard_suppresses_wake_key_repeats();
+  test_async_startup_auto_retry_and_manual_retry();
+  test_async_startup_mode_change_while_connecting_reconfigures_on_ready();
+  test_async_startup_cancel_on_recovery_compile_and_gallery();
+  test_async_startup_shutdown_during_connect_exits_promptly();
   std::cout << "test_ui_controller: ALL PASSED\n";
   return 0;
 }

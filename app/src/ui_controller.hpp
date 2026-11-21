@@ -10,6 +10,7 @@
 #include "video_player.hpp"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -57,6 +58,10 @@ struct UiControllerOptions {
   bool mock_backend = false;
   bool persist_config = true;
   bool skip_startup_recovery_scan = false;
+  bool async_backend_start = false;
+  bool defer_initial_backend_start = false;
+  int startup_max_attempts = 3;
+  int startup_retry_base_delay_ms = 500;
 };
 
 struct UiState {
@@ -120,6 +125,9 @@ struct UiState {
   uint64_t free_bytes = 0;
   bool backend_ready = false;
   bool backend_paused = false;
+  bool backend_connecting = false;
+  int backend_connect_attempt = 0;
+  int backend_connect_max_attempts = 3;
   std::string backend_error;
   std::string toast_message;
   bool toast_is_error = false;
@@ -161,6 +169,13 @@ class UiController {
   void persist_config();
   bool reconfigure_backend(std::string& out_err);
   void sync_backend_status();
+  void begin_backend_start_async(uint64_t now_ms, bool is_manual_retry);
+  void cancel_backend_start_async();
+  void poll_backend_start_async(uint64_t now_ms);
+  void apply_live_controls();
+  bool guard_capture_while_connecting(uint64_t now_ms);
+  void suspend_backend_for_modal(std::string* out_err);
+  void restore_backend_after_modal(uint64_t now_ms);
 
   void switch_mode(AppMode target);
   void adjust_zoom(int delta_step);
@@ -244,6 +259,18 @@ class UiController {
   bool compile_from_recovery_ = false;
   std::string compile_result_msg_;
   TimelapseManifest compile_fallback_manifest_;
+
+  std::thread start_thread_;
+  std::mutex start_mutex_;
+  std::condition_variable start_cv_;
+  bool start_cancel_ = false;
+  std::atomic<bool> start_in_flight_{false};
+  std::atomic<bool> start_finished_{false};
+  bool start_ok_ = false;
+  bool start_manual_retry_ = false;
+  std::atomic<int> start_attempt_{0};
+  std::string start_error_;
+  CameraStreamSpec started_spec_;
 };
 
 }  // namespace cz

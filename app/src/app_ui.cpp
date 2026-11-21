@@ -808,7 +808,8 @@ struct AppView::Impl {
     canvas.fill_rect(vf_x, 0, kVfW, kVfH, pal.viewfinder_surround);
 
     const bool show_live_frame =
-        state.backend_ready && !state.backend_paused && live_frame != nullptr &&
+        state.backend_ready && !state.backend_paused &&
+        !state.backend_connecting && live_frame != nullptr &&
         !live_frame->rgb24.empty() && live_frame->width > 0 &&
         live_frame->height > 0;
 
@@ -834,13 +835,34 @@ struct AppView::Impl {
       }
       canvas.draw_rgb24(vf_x, feed_y, feed_w, feed_h, scaled_vf.data());
     } else {
-      const std::string msg = state.backend_paused
-                                  ? "Camera Paused"
-                                  : (state.backend_ready ? "Waiting for frame..."
-                                                         : "Camera Offline [R]");
-      const int mw = canvas.measure_text(FontRole::Sans, 9, msg);
-      canvas.draw_text(FontRole::Sans, 9, vf_x + (kVfW - mw) / 2, 79, msg,
-                       pal.muted_foreground);
+      auto draw_centered_vf_text = [&](int y, const std::string& txt,
+                                       uint32_t col) {
+        const int tw = canvas.measure_text(FontRole::Sans, 9, txt);
+        canvas.draw_text(FontRole::Sans, 9, vf_x + (kVfW - tw) / 2, y, txt,
+                         col);
+      };
+      if (state.backend_paused) {
+        draw_centered_vf_text(79, "Camera Paused", pal.muted_foreground);
+      } else if (state.backend_connecting) {
+        std::string msg = "Connecting...";
+        if (state.backend_connect_attempt > 1) {
+          const int max_att = std::max(state.backend_connect_attempt,
+                                       state.backend_connect_max_attempts);
+          msg = "Connecting (" +
+                std::to_string(state.backend_connect_attempt) + "/" +
+                std::to_string(max_att) + ")...";
+        }
+        draw_centered_vf_text(79, msg, pal.muted_foreground);
+      } else if (state.backend_ready) {
+        draw_centered_vf_text(79, "Waiting for frame...", pal.muted_foreground);
+      } else {
+        draw_centered_vf_text(71, "Camera Offline [R]", pal.muted_foreground);
+        if (!state.backend_error.empty()) {
+          const std::string err_fit = canvas.truncate_right(
+              FontRole::Sans, 9, state.backend_error, kVfW - 16);
+          draw_centered_vf_text(86, err_fit, pal.status_error);
+        }
+      }
     }
 
     // Rule-of-thirds overlay
