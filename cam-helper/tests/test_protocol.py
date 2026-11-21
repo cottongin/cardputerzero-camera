@@ -491,7 +491,7 @@ class ProtocolTest(unittest.TestCase):
             if w_fd not in closed_fds:
                 real_close(w_fd)
 
-    def test_json_protocol_server_calls_shutdown_if_worker_start_raises(self):
+    def test_json_protocol_server_emits_error_and_shuts_down_if_worker_start_raises(self):
         events = []
 
         class FailingStartWorker:
@@ -502,14 +502,23 @@ class ProtocolTest(unittest.TestCase):
             def shutdown(self):
                 events.append("shutdown")
 
+        stdout_buf = io.StringIO()
+        stderr_buf = io.StringIO()
         server = JsonProtocolServer(
             worker_factory=lambda _emit: FailingStartWorker(),
             stdin=io.StringIO(""),
-            stdout=io.StringIO(""),
+            stdout=stdout_buf,
         )
-        with self.assertRaisesRegex(RuntimeError, "camera open failed"):
-            server.run()
+        with mock.patch("sys.stderr", stderr_buf):
+            rc = server.run()
+        self.assertEqual(rc, 1)
         self.assertEqual(events, ["start", "shutdown"])
+        lines = [json.loads(line) for line in stdout_buf.getvalue().splitlines() if line.strip()]
+        self.assertEqual(
+            lines,
+            [{"event": "error", "code": "startup_failed", "message": "camera open failed"}],
+        )
+        self.assertIn("camera open failed", stderr_buf.getvalue())
 
 
 if __name__ == "__main__":

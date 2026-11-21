@@ -7,6 +7,7 @@ import os
 import select
 import struct
 import threading
+import traceback
 from typing import Any, Callable, Optional, TextIO
 
 PROTOCOL_VERSION = 1
@@ -365,7 +366,18 @@ class JsonProtocolServer:
         stdin_fd = self._get_stdin_fd() if self._wakeup_fd is not None else None
         fd_buf = bytearray()
         try:
-            self._worker.start()
+            try:
+                self._worker.start()
+            except Exception as exc:  # noqa: BLE001
+                traceback.print_exc()
+                self.emit_event(
+                    {
+                        "event": "error",
+                        "code": "startup_failed",
+                        "message": str(exc) or type(exc).__name__,
+                    }
+                )
+                return 1
             while not self._shutdown_requested:
                 if stdin_fd is not None and self._wakeup_fd is not None:
                     raw_line = self._read_line_fd(stdin_fd, self._wakeup_fd, fd_buf)
