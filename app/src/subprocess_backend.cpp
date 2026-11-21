@@ -27,7 +27,9 @@ namespace {
 
 constexpr int kChildFrameFd = 3;
 constexpr size_t kMaxLogBytes = 5u * 1024u * 1024u;
-constexpr int kReadyTimeoutMs = 5000;
+constexpr int kReadyTimeoutMs = 15000;
+constexpr int kConfigureTimeoutMs = 10000;
+constexpr int kCaptureTimeoutMs = 10000;
 constexpr int kCommandTimeoutMs = 5000;
 constexpr int kStopVideoTimeoutMs = 10000;
 constexpr int kShutdownTimeoutMs = 1000;
@@ -426,7 +428,7 @@ void SubprocessCameraBackend::stop_locked() {
       if (!reap_pid_with_timeout(cur_pid, kShutdownTimeoutMs / 2, 10, nullptr,
                                  nullptr)) {
         ::kill(cur_pid, SIGTERM);
-        if (!reap_pid_with_timeout(cur_pid, 500, 10, nullptr, nullptr)) {
+        if (!reap_pid_with_timeout(cur_pid, 1000, 10, nullptr, nullptr)) {
           ::kill(cur_pid, SIGKILL);
           int st = 0;
           while (::waitpid(cur_pid, &st, 0) < 0 && errno == EINTR) {
@@ -458,6 +460,17 @@ void SubprocessCameraBackend::stop_locked() {
   stopping_ = false;
 }
 
+void SubprocessCameraBackend::cancel_start() {
+  std::lock_guard<std::mutex> st_lock(state_mutex_);
+  start_cancelled_ = true;
+  reply_cv_.notify_all();
+}
+
+void SubprocessCameraBackend::reset_start_cancel() {
+  std::lock_guard<std::mutex> st_lock(state_mutex_);
+  start_cancelled_ = false;
+}
+
 bool SubprocessCameraBackend::start(const CameraStreamSpec& initial_spec,
                                     std::string& out_err) {
   std::lock_guard<std::mutex> life_lock(lifecycle_mutex_);
@@ -471,6 +484,11 @@ bool SubprocessCameraBackend::start(const CameraStreamSpec& initial_spec,
 
   {
     std::lock_guard<std::mutex> st_lock(state_mutex_);
+    if (start_cancelled_) {
+      out_err = "camera startup cancelled";
+      last_error_ = out_err;
+      return false;
+    }
     child_pid_ = -1;
     child_running_ = false;
     ready_ = false;
@@ -479,6 +497,7 @@ bool SubprocessCameraBackend::start(const CameraStreamSpec& initial_spec,
     audio_warning_ = false;
     stopping_ = false;
     process_dead_ = false;
+    error_event_received_ = false;
     last_error_.clear();
     backend_name_ = "picamera2-subprocess";
     ready_received_ = false;
@@ -638,15 +657,21 @@ bool SubprocessCameraBackend::start(const CameraStreamSpec& initial_spec,
   // Wait for {"event":"ready",...}
   bool got_ready = false;
   bool ready_ok = false;
+  bool cancelled = false;
   std::string ready_err;
   {
     std::unique_lock<std::mutex> st_lock(state_mutex_);
     got_ready = reply_cv_.wait_for(
-        st_lock, std::chrono::milliseconds(kReadyTimeoutMs),
-        [&]() { return ready_received_ || process_dead_ || stopping_; });
+        st_lock, std::chrono::milliseconds(kReadyTimeoutMs), [&]() {
+          return ready_received_ || process_dead_ || stopping_ ||
+                 start_cancelled_;
+        });
+    cancelled = start_cancelled_;
     ready_ok = ready_ok_;
     ready_err = ready_error_;
-    if (!got_ready) {
+    if (cancelled) {
+      ready_err = "camera startup cancelled";
+    } else if (!got_ready) {
       ready_err = "timed out waiting for camera helper ready event";
     } else if (process_dead_ && ready_err.empty()) {
       ready_err = last_error_.empty() ? "camera helper exited before ready"
@@ -654,7 +679,7 @@ bool SubprocessCameraBackend::start(const CameraStreamSpec& initial_spec,
     }
   }
 
-  if (!got_ready || !ready_ok) {
+  if (cancelled || !got_ready || !ready_ok) {
     out_err = ready_err.empty() ? "camera helper failed to initialize"
                                 : ready_err;
     stop_locked();
@@ -670,12 +695,22 @@ bool SubprocessCameraBackend::start(const CameraStreamSpec& initial_spec,
     return false;
   }
 
+  {
+    std::lock_guard<std::mutex> st_lock(state_mutex_);
+    if (!start_cancelled_) {
+      ready_ = true;
+      paused_ = false;
+      recording_ = false;
+      last_error_.clear();
+      return true;
+    }
+  }
+
+  out_err = "camera startup cancelled";
+  stop_locked();
   std::lock_guard<std::mutex> st_lock(state_mutex_);
-  ready_ = true;
-  paused_ = false;
-  recording_ = false;
-  last_error_.clear();
-  return true;
+  last_error_ = out_err;
+  return false;
 }
 
 void SubprocessCameraBackend::stop() {
@@ -699,6 +734,11 @@ bool SubprocessCameraBackend::send_command(
     if (stopping_ || process_dead_ || !child_running_) {
       out_err = last_error_.empty() ? "camera helper is not running"
                                     : last_error_;
+      return false;
+    }
+    if (allow_before_ready && start_cancelled_) {
+      out_err = "camera startup cancelled";
+      last_error_ = out_err;
       return false;
     }
     if (!allow_before_ready && !ready_) {
@@ -742,10 +782,16 @@ bool SubprocessCameraBackend::send_command(
   std::unique_lock<std::mutex> st_lock(state_mutex_);
   const bool woke = reply_cv_.wait_for(
       st_lock, std::chrono::milliseconds(timeout_ms), [&]() {
-        return pending_reply_ready_ || process_dead_ || stopping_;
+        return pending_reply_ready_ || process_dead_ || stopping_ ||
+               (allow_before_ready && start_cancelled_);
       });
 
   pending_cmd_id_ = 0;
+  if (allow_before_ready && start_cancelled_) {
+    out_err = "camera startup cancelled";
+    last_error_ = out_err;
+    return false;
+  }
   if (!woke) {
     out_err = "camera helper command '" + cmd_name + "' timed out";
     last_error_ = out_err;
@@ -796,8 +842,8 @@ bool SubprocessCameraBackend::send_configure(const CameraStreamSpec& spec,
        << json_detail::escape_json_string(transform) << "\"";
 
   std::map<std::string, json_detail::JsonValue> reply;
-  if (!send_command("configure", body.str(), kCommandTimeoutMs, reply, out_err,
-                    allow_before_ready)) {
+  if (!send_command("configure", body.str(), kConfigureTimeoutMs, reply,
+                    out_err, allow_before_ready)) {
     return false;
   }
   std::lock_guard<std::mutex> st_lock(state_mutex_);
@@ -854,7 +900,7 @@ bool SubprocessCameraBackend::pause(std::string& out_err) {
 bool SubprocessCameraBackend::resume(std::string& out_err) {
   std::lock_guard<std::mutex> cmd_lock(cmd_mutex_);
   std::map<std::string, json_detail::JsonValue> reply;
-  if (!send_command("resume", "", kCommandTimeoutMs, reply, out_err)) {
+  if (!send_command("resume", "", kConfigureTimeoutMs, reply, out_err)) {
     return false;
   }
   std::lock_guard<std::mutex> st_lock(state_mutex_);
@@ -906,7 +952,7 @@ StillCaptureResult SubprocessCameraBackend::capture_still(
        << "\",\"width\":" << width << ",\"height\":" << height;
 
   std::map<std::string, json_detail::JsonValue> reply;
-  if (!send_command("capture_still", body.str(), kCommandTimeoutMs, reply,
+  if (!send_command("capture_still", body.str(), kCaptureTimeoutMs, reply,
                     res.error)) {
     return res;
   }
@@ -1030,6 +1076,23 @@ void SubprocessCameraBackend::handle_stdout_line(const std::string& line) {
       }
       return;
     }
+    if (event == "error") {
+      const std::string code = get_json_str(obj, "code");
+      const std::string msg = get_json_str(obj, "message");
+      const std::string err_msg =
+          !msg.empty() ? msg
+                       : (!code.empty() ? code : "camera helper error");
+      std::lock_guard<std::mutex> st_lock(state_mutex_);
+      error_event_received_ = true;
+      last_error_ = err_msg;
+      if (!ready_received_) {
+        ready_received_ = true;
+        ready_ok_ = false;
+        ready_error_ = err_msg;
+        reply_cv_.notify_all();
+      }
+      return;
+    }
     return;
   }
 
@@ -1140,7 +1203,9 @@ void SubprocessCameraBackend::stdout_reader_loop(int stdout_fd,
   ready_ = false;
   recording_ = false;
   if (!was_stopping) {
-    last_error_ = reason;
+    if (!error_event_received_) {
+      last_error_ = reason;
+    }
     if (!ready_received_) {
       ready_received_ = true;
       ready_ok_ = false;

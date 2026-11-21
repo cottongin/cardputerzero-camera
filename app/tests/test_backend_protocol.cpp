@@ -698,6 +698,197 @@ void test_subprocess_backend_crash_recovery_no_deadlock() {
   }
 }
 
+void write_executable_script(const std::string& path,
+                             const std::string& body) {
+  {
+    std::ofstream out(path);
+    assert(out.is_open());
+    out << body;
+  }
+  assert(::chmod(path.c_str(), 0755) == 0);
+}
+
+void test_subprocess_backend_startup_error_event_and_cancel_restart() {
+  TempDir tmp("subproc_err_cancel");
+  cz::CameraStreamSpec spec;
+
+  // 1. Startup error event propagation
+  {
+    const std::string err_helper = tmp.path + "/startup_error_helper.py";
+    write_executable_script(
+        err_helper,
+        "#!/usr/bin/python3\n"
+        "import json, sys\n"
+        "sys.stdout.write(json.dumps({'event':'error','code':'startup_failed',"
+        "'message':'imx219 busy: EBUSY'}) + '\\n')\n"
+        "sys.stdout.flush()\n"
+        "sys.exit(1)\n");
+
+    cz::SubprocessCameraBackend backend(err_helper);
+    std::string err;
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = backend.start(spec, err);
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0)
+            .count();
+
+    assert(!ok);
+    assert(elapsed_ms < 2000);
+    assert(err == "imx219 busy: EBUSY");
+    assert(backend.status().last_error == "imx219 busy: EBUSY");
+    assert(!backend.status().ready);
+    assert(backend.child_pid() == -1);
+  }
+
+  // 2. Cancel in-flight start() during ready wait & cleanly restart after
+  //    reset_start_cancel() on the same SubprocessCameraBackend instance.
+  {
+    const std::string marker = tmp.path + "/first_run.marker";
+    const std::string stateful_helper = tmp.path + "/stateful_helper.py";
+    write_executable_script(
+        stateful_helper,
+        "#!/usr/bin/python3\n"
+        "import json, os, sys, time\n"
+        "marker = '" +
+            marker +
+            "'\n"
+            "if not os.path.exists(marker):\n"
+            "    with open(marker, 'w') as f:\n"
+            "        f.write('1')\n"
+            "    time.sleep(10.0)\n"
+            "sys.stdout.write(json.dumps({'event':'ready','protocol':1,"
+            "'backend':'mock','has_audio':False}) + '\\n')\n"
+            "sys.stdout.flush()\n"
+            "for line in sys.stdin:\n"
+            "    msg = json.loads(line)\n"
+            "    sys.stdout.write(json.dumps({'id': msg.get('id'), 'ok': True}) "
+            "+ '\\n')\n"
+            "    sys.stdout.flush()\n"
+            "    if msg.get('cmd') == 'shutdown':\n"
+            "        break\n");
+
+    cz::SubprocessCameraBackend backend(stateful_helper);
+    std::string err;
+    bool start_ok = true;
+    long long elapsed_ms = -1;
+
+    std::thread starter([&]() {
+      const auto t0 = std::chrono::steady_clock::now();
+      start_ok = backend.start(spec, err);
+      elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now() - t0)
+                       .count();
+    });
+
+    const auto spawn_dl =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(2000);
+    while (std::chrono::steady_clock::now() < spawn_dl) {
+      if (backend.child_pid() > 0 && fs::exists(marker)) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    const pid_t slow_pid = backend.child_pid();
+    assert(slow_pid > 0);
+    assert(fs::exists(marker));
+
+    backend.cancel_start();
+    starter.join();
+
+    assert(!start_ok);
+    assert(elapsed_ms >= 0 && elapsed_ms < 2000);
+    assert(err == "camera startup cancelled");
+    assert(backend.status().last_error == "camera startup cancelled");
+    assert(!backend.status().ready);
+    assert(backend.child_pid() == -1);
+    int st = 0;
+    assert(::waitpid(slow_pid, &st, WNOHANG) == -1 && errno == ECHILD);
+
+    // Calling start() without reset_start_cancel() must fail immediately
+    // before fork().
+    assert(!backend.start(spec, err));
+    assert(err == "camera startup cancelled");
+    assert(backend.child_pid() == -1);
+
+    // After reset_start_cancel(), the second run succeeds immediately.
+    backend.reset_start_cancel();
+    assert(backend.start(spec, err));
+    assert(err.empty());
+    assert(backend.status().ready);
+    const pid_t fast_pid = backend.child_pid();
+    assert(fast_pid > 0);
+    backend.stop();
+    assert(!backend.status().ready);
+    assert(backend.child_pid() == -1);
+    assert(::waitpid(fast_pid, &st, WNOHANG) == -1 && errno == ECHILD);
+  }
+
+  // 3. Cancel in-flight start() during initial configure (allow_before_ready).
+  {
+    const std::string cfg_marker = tmp.path + "/cfg.marker";
+    const std::string slow_cfg_helper = tmp.path + "/slow_cfg_helper.py";
+    write_executable_script(
+        slow_cfg_helper,
+        "#!/usr/bin/python3\n"
+        "import json, sys, time\n"
+        "marker = '" +
+            cfg_marker +
+            "'\n"
+            "sys.stdout.write(json.dumps({'event':'ready','protocol':1,"
+            "'backend':'mock','has_audio':False}) + '\\n')\n"
+            "sys.stdout.flush()\n"
+            "for line in sys.stdin:\n"
+            "    msg = json.loads(line)\n"
+            "    if msg.get('cmd') == 'configure':\n"
+            "        with open(marker, 'w') as f:\n"
+            "            f.write('1')\n"
+            "        time.sleep(10.0)\n"
+            "    sys.stdout.write(json.dumps({'id': msg.get('id'), 'ok': True}) "
+            "+ '\\n')\n"
+            "    sys.stdout.flush()\n");
+
+    cz::SubprocessCameraBackend backend(slow_cfg_helper);
+    std::string err;
+    bool start_ok = true;
+    long long elapsed_ms = -1;
+
+    std::thread starter([&]() {
+      const auto t0 = std::chrono::steady_clock::now();
+      start_ok = backend.start(spec, err);
+      elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now() - t0)
+                       .count();
+    });
+
+    const auto cfg_dl =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(2000);
+    while (std::chrono::steady_clock::now() < cfg_dl) {
+      if (backend.child_pid() > 0 && fs::exists(cfg_marker)) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    const pid_t cfg_pid = backend.child_pid();
+    assert(cfg_pid > 0);
+    assert(fs::exists(cfg_marker));
+
+    backend.cancel_start();
+    starter.join();
+
+    assert(!start_ok);
+    assert(elapsed_ms >= 0 && elapsed_ms < 2000);
+    assert(err == "camera startup cancelled");
+    assert(backend.status().last_error == "camera startup cancelled");
+    assert(!backend.status().ready);
+    assert(backend.child_pid() == -1);
+    int st = 0;
+    assert(::waitpid(cfg_pid, &st, WNOHANG) == -1 && errno == ECHILD);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -705,6 +896,7 @@ int main() {
   test_sim_backend_lifecycle();
   test_subprocess_backend_with_mock_driver();
   test_subprocess_backend_crash_recovery_no_deadlock();
+  test_subprocess_backend_startup_error_event_and_cancel_restart();
   std::cout << "All test_backend_protocol tests passed!\n";
   return 0;
 }

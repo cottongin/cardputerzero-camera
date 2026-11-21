@@ -49,6 +49,8 @@ class SubprocessCameraBackend final : public ICameraBackend {
 
   bool start(const CameraStreamSpec& initial_spec,
              std::string& out_err) override;
+  void cancel_start() override;
+  void reset_start_cancel() override;
   void stop() override;
   bool reconfigure(const CameraStreamSpec& spec,
                    std::string& out_err) override;
@@ -117,6 +119,8 @@ class SubprocessCameraBackend final : public ICameraBackend {
   bool audio_warning_ = false;
   bool stopping_ = false;
   bool process_dead_ = false;
+  bool start_cancelled_ = false;
+  bool error_event_received_ = false;
   std::string last_error_;
   std::string backend_name_ = "picamera2-subprocess";
 

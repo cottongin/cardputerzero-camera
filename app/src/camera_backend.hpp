@@ -67,6 +67,8 @@ class ICameraBackend {
 
   virtual bool start(const CameraStreamSpec& initial_spec,
                      std::string& out_err) = 0;
+  virtual void cancel_start() {}
+  virtual void reset_start_cancel() {}
   virtual void stop() = 0;
   virtual bool reconfigure(const CameraStreamSpec& spec,
                            std::string& out_err) = 0;
