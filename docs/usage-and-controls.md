@@ -24,7 +24,7 @@ The `320×170` canvas splits into two regions whose horizontal side swaps dynami
   - **`5` / `7`**: Steps ISP `ScalerCrop` (`1.0x`, `1.5x`, `2.0x`, `3.0x`, `4.0x`). Both the live preview and captured media are cropped cleanly to that region (active across Photo, Video, and Timelapse).
   - **`Z`**: Toggles a **`2x` Viewfinder-Only Loupe** for checking framing/focus in Photo, Video, or Timelapse (idle or active capture) without cropping saved images/frames. Lowercase `h` / `l` remain dedicated to `Left` / `Right` `hjkl` navigation everywhere.
 - **Exposure Value (card 1, `Left`/`Right`):** `-2.0` to `+2.0` in `0.5` EV steps.
-- **Photo Filters (`F` or card 2):** Cycles all 9 filters live on the preview and applies them on JPEG save (`None` writes the sensor JPEG directly with zero re-encode):
+- **Photo Filters (`F` or card 2):** Cycles all 9 filters live on the preview and applies them on JPEG save (`None` saves the captured JPEG directly without C++ re-encoding):
   `None` (`none`), `B&W` (`bw`), `Hi-Con` (`hicon`), `Sepia` (`sepia`), `Cool` (`cool`), `Vivid` (`vivid`), `Invert` (`invert`), `Retro` (`retro`), `GameBoy` (`gameboy`, scaled integer blocks with 4-shade Bayer DMG palette).
 - **Self-Timer (`C` or card 3):** Cycles `Off` (`0s`), `3s`, `10s`. Press `Esc` during countdown to cancel without quitting.
 - **Shutter (`Enter`, `Space`, `6`):** Stages to `.IMG_<ts>.jpg.tmp`, applies filter if active, `fsync`s, and commits atomically to `IMG_<ts>.jpg` (adding `_01`, `_02`, ... on same-second collisions).
@@ -149,7 +149,8 @@ Environment variables:
 ## 8. Troubleshooting
 
 - **"Camera Offline [R]" shown on device:**
-  1. Check `grep imx219 /boot/firmware/config.txt` (`dtoverlay=imx219`) and `rpicam-hello --list-cameras`.
-  2. Verify `/usr/bin/czcamera-cam --mock-driver --frame-fd 3` manually, or press `R` inside `czcamera` to respawn the backend.
+  1. `czcamera` starts the camera asynchronously (`"Connecting..."` / `"Connecting (2/3)..."`) and auto-retries up to 3 times; if startup still fails, the error reason appears beneath `"Camera Offline [R]"`. Press `R` to start another retry cycle.
+  2. Inspect `~/.local/share/czcamera/czcamera.log` (overridable via `CZCAMERA_LOG`) for helper stderr / Python tracebacks, and check `grep imx219 /boot/firmware/config.txt` (`dtoverlay=imx219`) and `rpicam-hello --list-cameras`.
+  3. Verify `/usr/bin/czcamera-cam --mock-driver --frame-fd 3` manually if the helper binary fails to launch.
 - **Video records muted (`audio_unavailable` toast):** Check ALSA capture device visibility (`arecord -l` and `alsamixer`); `czcamera` automatically records muted video rather than dropping the shot.
 - **Upside-down or mirrored preview on custom lens mount:** Open **Settings (`S`) → `Camera Orient`** and cycle `auto`, `0`, `180`, `hflip`, or `vflip`.

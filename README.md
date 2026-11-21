@@ -23,7 +23,7 @@ The interface splits the screen between a live viewfinder and a control rail wit
 
 ### Photo (`1`)
 
-Photo mode saves `8MP` (default) or `2MP` (`R`) JPEGs with EV adjustment (`-2.0` to `+2.0`), an `Off`/`3s`/`10s` self-timer (`C`), `1.0x` to `4.0x` cropped zoom (`5`/`7`), and a `2x` viewfinder-only Loupe (`Z`) to check focus without cropping the final image. Pressing `F` cycles all nine filters on the live preview; `None` saves the sensor JPEG directly without re-encoding.
+Photo mode saves `8MP` (default) or `2MP` (`R`) JPEGs with EV adjustment (`-2.0` to `+2.0`), an `Off`/`3s`/`10s` self-timer (`C`), `1.0x` to `4.0x` cropped zoom (`5`/`7`), and a `2x` viewfinder-only Loupe (`Z`) to check focus without cropping the final image. Pressing `F` cycles all nine filters on the live preview; `None` saves the captured JPEG directly without C++ re-encoding.
 
 ### Video (`2`)
 
@@ -83,7 +83,7 @@ For the desktop SDL2 simulator, native device builds, and unit tests, see [Build
 
 | Symptom | Check or fix |
 |---|---|
-| `Camera Offline [R]` on launch | Press `R` to retry startup. If it stays offline, check `grep imx219 /boot/firmware/config.txt` and `rpicam-hello --list-cameras`. |
+| `Camera Offline [R]` on launch | `czcamera` shows `"Connecting..."` and auto-retries up to 3 times before displaying the error reason below `Camera Offline [R]`. Press `R` to retry, and check `~/.local/share/czcamera/czcamera.log`, `grep imx219 /boot/firmware/config.txt`, and `rpicam-hello --list-cameras`. |
 | Video records without audio (`audio_unavailable`) | When audio capture fails, `czcamera` records a silent `.mp4` instead of dropping the clip. Check ALSA inputs with `arecord -l` and `alsamixer`. |
 | Upside-down or mirrored preview | Open Settings (`S`) and cycle `Camera Orient` (`auto`, `0`, `180`, `hflip`, `vflip`). |
 | Recovery prompt appears on startup | An earlier timelapse ended before finishing. Press `C` to compile frames to `.mp4`, `K` to keep the raw JPEGs, `D` to discard them, or `Esc` to defer. |

@@ -37,7 +37,7 @@
 ```
 
 ### Replacing `picamera2` with Native `libcamera` Later
-`czcamera` C++ sources have **zero** `#include <libcamera/...>` or CMake linkage to `libcamera.so`. To swap `python3-picamera2` for a native C++ `libcamera` backend (or `rpicam-apps`), implement [`app/src/camera_backend.hpp`](../app/src/camera_backend.hpp) (`cz::ICameraBackend`) and return it from `create_camera_backend()` in [`app/src/sim_backend.cpp`](../app/src/sim_backend.cpp) without touching `UiController`, `AppView`, filters, timelapse, or gallery code.
+`czcamera` C++ sources have **zero** `#include <libcamera/...>` or CMake linkage to `libcamera.so`. To swap `python3-picamera2` for a native C++ `libcamera` backend (or `rpicam-apps`), implement [`app/src/camera_backend.hpp`](../app/src/camera_backend.hpp) (`cz::ICameraBackend`) and return it from `create_camera_backend()` in [`app/src/sim_backend.cpp`](../app/src/sim_backend.cpp) without touching `UiController`, `AppView`, filters, timelapse, or gallery code. Interactive launches invoke `ICameraBackend::start()` asynchronously on a worker thread with up to 3 automatic retry attempts (and cancel/defer in-flight startup via `cancel_start()` / `reset_start_cancel()` when opening Gallery or starting `TimelapseRecovery` `[C]` compilation).
 
 ---
 
@@ -53,7 +53,7 @@ Requests from C++ → Python carry `"id"` (uint64) and `"cmd"`:
 |---|---|---|
 | `configure` | `mode` (`"photo"`/`"video"`/`"timelapse"`), `main_w`, `main_h`, `preview_w` (`226`), `preview_h` (`170`), `fps`, `zoom`, `ev`, `transform` (`"auto"`/`"0"`/`"180"`/`"hflip"`/`"vflip"`) | `mode`, `main_w`, `main_h`, `preview_w`, `preview_h` (`226x128` for 16:9 modes), `transform`, `is_16_9` |
 | `set_controls` | Optional `zoom` (`1.0..4.0`), `ev` (`-2.0..+2.0`) | `zoom`, `ev` |
-| `capture_still` | `tmp_path`, `width`, `height` | `bytes` (temporarily stops video / switches to still format if needed and restores stream config) |
+| `capture_still` | `tmp_path`, `width`, `height` | `width`, `height`, `bytes` (encodes `YUV420` via `simplejpeg` directly from `main` for `2MP`/`1080p`, or temporarily switches to a `buffer_count=1` `YUV420` still config for `8MP`/Video and restores stream config) |
 | `start_video` | `tmp_path`, `width`, `height`, `fps`, `bitrate`, `audio` (`bool`) | `audio_recorded` (`bool`) |
 | `stop_video` | — | `duration_sec`, `bytes`, `audio_recorded` |
 | `pause` | — | Stops recording if active, closes camera & releases IMX219 lock |
@@ -63,7 +63,7 @@ Requests from C++ → Python carry `"id"` (uint64) and `"cmd"`:
 Asynchronous Events from Python → C++ (no `"id"`):
 - `{"event": "ready", "protocol": 1, "backend": "picamera2"|"mock", "sensor": "...", "has_audio": true|false}`
 - `{"event": "warn", "code": "...", "message": "..."}` (for example `"audio_unavailable"`, `"invalid_json"`, `"control_error"`)
-- `{"event": "error", "code": "...", "message": "..."}`
+- `{"event": "error", "code": "...", "message": "..."}` (for example `"startup_failed"` emitted by `JsonProtocolServer` when worker `start()` raises, with the traceback written to stderr / `~/.local/share/czcamera/czcamera.log`)
 
 ### Binary Preview Frame Channel (`--frame-fd <N>`, 16-Byte `CZFR` Header)
 
@@ -88,6 +88,7 @@ Every preview frame packet starts with a fixed **16-byte little-endian** header 
 ## 3. Target Hardware Constraints & Media Pipelines
 
 - **Sony IMX219 Sensor Modes:** `640×480` (4:3, crop `(1000,752)/1280×960`), `1640×1232` (4:3 full-FOV 2×2 binned), `1920×1080` (16:9 crop), `3280×2464` (4:3 8MP full sensor).
+- **Low-CMA Camera Streams (`Picam2Worker`):** Photo and Timelapse modes run live preview with `create_preview_configuration` (`main` `YUV420` at `1640×1232` for `4:3` or `1920×1080` for `16:9`, `lores` `YUV420`, `buffer_count=2`, `raw=None`). Video mode uses `create_video_configuration` (`buffer_count=4`, `raw=None`). Stills encode `YUV420` planes to JPEG via `simplejpeg` (`2MP`/`1080p` fast-path without mode switching; `8MP` or Video-mode stills stop preview for an on-demand `buffer_count=1` `YUV420` still capture and restore preview afterward).
 - **Video Output (`FfmpegOutput`):** `_FfmpegOutputTarget` overrides `.split()` cleanly around `picamera2.outputs.FfmpegOutput`'s whitespace `.split()` so staging paths containing spaces or special characters (and ending in `.mp4.part`, with `-f mp4 -movflags +faststart`) remain exact `argv` tokens.
 - **Timelapse Compilation:** [`TimelapseEngine`](../app/src/timelapse_engine.hpp) invokes `ffmpeg` with `-threads 1 -filter_threads 1` and scales `4:3` (`2mp`/`8mp`) to `1024:768` or `16:9` (`1080p`) to `1280:720` (`bilinear,setsar=1`) to stay safely within CardputerZero's 512 MB RAM / 64 MB CMA budget and VideoCore IV `/dev/video11` constraints, encoding with `h264_v4l2m2m` (`-num_output_buffers 4`, `5M`, `yuv420p`) and falling back to low-memory `libx264` (`-threads 2 -preset ultrafast -crf 23 -x264-params rc-lookahead=0:ref=1:bframes=0:threads=2:lookahead-threads=1:sync-lookahead=0`) on failure.
 - **Gallery Playback:** [`VideoPlayer`](../app/src/video_player.hpp) probes duration & audio presence via `ffprobe`, spawns `ffmpeg` raw `rgb24` frames timed cleanly to PTS, and drives audio through ALSA `aplay` on Linux or `set_pcm_sink` (SDL2 audio queue) on desktop—allowing silent `.mp4` files (compiled timelapses or muted clips) to play smoothly without audio failure.
